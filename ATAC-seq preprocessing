@@ -1,1 +1,824 @@
 
+Helt nytt skript for ATAC seq (laget 10.12.2025)
+
+### 1. FastQC on all raw FastQs
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+RAW_QC_DIR="${BASE}/fastqc_raw"
+
+mkdir -p "${RAW_QC_DIR}"
+
+# Run FastQC on all raw fastq.gz files in all Sample_* folders
+fastqc -t 16 "${BASE}"/Sample_*/*_R[12]_001.fastq.gz -o "${RAW_QC_DIR}"
+
+cd "${RAW_QC_DIR}"
+multiqc .
+
+
+
+
+###2. Trimmomatic in a for loop all 12 samples. Trimming adapter were downloaded from: http://www.usadellab.org/cms/?page=trimmomatic
+# Make a bash script
+run_trimming.sh
+
+
+#Run trimmomatic on all 12 samples in a for loop
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+TRIM_DIR="${BASE}/trimmed"
+mkdir -p "${TRIM_DIR}"
+
+TRIM_JAR="${BASE}/Trimmomatic/Trimmomatic-0.39/Trimmomatic-0.39/trimmomatic-0.39.jar"
+ADAPTERS="${BASE}/Trimmomatic/Trimmomatic-0.39/Trimmomatic-0.39/adapters/NexteraPE-PE.fa"
+
+# sanity checks
+command -v java >/dev/null || { echo "ERROR: Java not found"; exit 1; }
+[[ -f "${TRIM_JAR}" ]] || { echo "ERROR: Trimmomatic jar not found"; exit 1; }
+[[ -f "${ADAPTERS}" ]] || { echo "ERROR: Adapter file not found"; exit 1; }
+
+for R1 in "${BASE}"/Sample_*/*_R1_001.fastq.gz; do
+    R2="${R1/_R1_001.fastq.gz/_R2_001.fastq.gz}"
+    [[ -f "${R2}" ]] || { echo "WARNING: missing R2 for ${R1}, skipping"; continue; }
+
+    sample_base=$(basename "${R1%_R1_001.fastq.gz}")
+    out_prefix="${TRIM_DIR}/${sample_base}"
+
+    echo ">>> Trimming ${sample_base}"
+
+    java -jar "${TRIM_JAR}" PE -threads 16 -phred33 \
+        -trimlog "${out_prefix}.trimlog" \
+        "${R1}" "${R2}" \
+        "${out_prefix}_R1_paired.fastq.gz"   "${out_prefix}_R1_unpaired.fastq.gz" \
+        "${out_prefix}_R2_paired.fastq.gz"   "${out_prefix}_R2_unpaired.fastq.gz" \
+        ILLUMINACLIP:"${ADAPTERS}":2:30:10:2:True \
+        LEADING:3 TRAILING:3 MINLEN:36
+
+    echo ">>> Done ${sample_base}"
+    echo
+done
+
+#Run the script in terminal
+chmod +x run_trimming.sh
+./run_trimming.sh
+
+
+#The trimming command will create these output files. An example is provided below.
+trimmed/
+  1-PANC1-DMSO-1_S381_L002_R1_paired.fastq.gz
+  1-PANC1-DMSO-1_S381_L002_R1_unpaired.fastq.gz
+  1-PANC1-DMSO-1_S381_L002_R2_paired.fastq.gz
+  1-PANC1-DMSO-1_S381_L002_R2_unpaired.fastq.gz
+  1-PANC1-DMSO-1_S381_L002.trimlog
+  ...
+
+
+#After trimming. ##iterates over all paired trimmed R1 files, infers corresponding R2 and extract sample name for running bowtie2
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+TRIM_DIR="${BASE}/trimmed"
+for R1P in "${TRIM_DIR}"/*_R1_paired.fastq.gz; do
+    R2P="${R1P/_R1_paired.fastq.gz/_R2_paired.fastq.gz}"
+    sample_base=$(basename "${R1P%_R1_paired.fastq.gz}")
+    # bowtie2 ... "${R1P}" "${R2P}" -> ${sample_base}.sam / bam
+done
+
+
+
+
+
+###. 3. Set bases and References and Run Bowtie2 for aligning all samples. 
+##Install Bowtie 2 and run bowtie2-build for creating a Bowtie 2 index file. 
+cd /data/human_genome
+
+bowtie2-build \
+  GCA_000001405.15_GRCh38_no_alt_analysis_set.fna \
+  GRCh38_index
+
+##It makes all these output files. This is done to achieve fast alignment since the file size are big. Bowtie2 will automatically find all 6 files.
+├── GRCh38_index.1.bt2
+├── GRCh38_index.2.bt2
+├── GRCh38_index.3.bt2
+├── GRCh38_index.4.bt2
+├── GRCh38_index.rev.1.bt2
+├── GRCh38_index.rev.2.bt2
+
+
+##Set all bases and references and run this as bash script for performing alignment 
+
+#Make bash script 
+nano align_all.sh
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+TRIM_DIR="${BASE}/trimmed"
+ALIGN_DIR="${BASE}/alignment"
+TMP_DIR="/data/tmp_samtools"
+
+mkdir -p "${ALIGN_DIR}" "${TMP_DIR}"
+
+BT2_INDEX="/data/human_genome/GRCh38_index"
+
+BT2_THREADS=6
+SORT_THREADS=2
+SORT_MEM="2G"
+
+for R1P in "${TRIM_DIR}"/*_R1_paired.fastq.gz; do
+  R2P="${R1P/_R1_paired.fastq.gz/_R2_paired.fastq.gz}"
+  [[ -f "${R2P}" ]] || { echo "ERROR: Missing R2 for ${R1P}"; exit 1; }
+
+  sample_base=$(basename "${R1P%_R1_paired.fastq.gz}")
+  BAM_SORTED="${ALIGN_DIR}/${sample_base}_sorted.bam"
+  BAI="${BAM_SORTED}.bai"
+  TMP_PREFIX="${TMP_DIR}/${sample_base}"
+
+  if [[ -s "${BAM_SORTED}" && -s "${BAI}" ]]; then
+    echo ">>> SKIP (already aligned): ${sample_base}"
+    continue
+  fi
+
+  echo ">>> Aligning ${sample_base}"
+
+  bowtie2 --threads "${BT2_THREADS}" --very-sensitive --no-discordant -X 2000 \
+    -x "${BT2_INDEX}" -1 "${R1P}" -2 "${R2P}" \
+  | samtools view -@ "${SORT_THREADS}" -b - \
+  | samtools sort -@ "${SORT_THREADS}" -m "${SORT_MEM}" \
+      -T "${TMP_PREFIX}" -o "${BAM_SORTED}" -
+
+  samtools index -@ "${SORT_THREADS}" "${BAM_SORTED}"
+
+  echo ">>> Done ${sample_base}"
+  echo
+done
+
+#Run alignment command in terminal 
+chmod +x align_all.sh
+./align_all.sh
+
+
+
+
+
+
+
+### 4.REMOVAL OF LOW QUALITY AND IMPROPERLY PAIRED READS UISNG SAMTOOLS VIEW (FILTERING)
+
+#Bash script
+nano filter_samtools_all.sh
+
+##!/usr/bin/env bash
+set -euo pipefail
+source config.sh
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+THREADS=6
+ALIGN_DIR="${BASE}/alignment"
+FILTER_DIR="${BASE}/filtered"
+mkdir -p "${FILTER_DIR}"
+
+for BAM in "${ALIGN_DIR}"/*_sorted.bam; do
+    sample_base=$(basename "${BAM%_sorted.bam}")
+    OUT="${FILTER_DIR}/${sample_base}_filtered.bam"
+
+    echo ">>> Filtering ${sample_base}"
+
+    samtools view -@ "${THREADS}" -bh -f 3 -q 30 "${BAM}" \
+      | samtools sort -@ "${THREADS}" -o "${OUT}" -
+
+    samtools index -@ "${THREADS}" "${OUT}"
+
+    echo ">>> Done ${sample_base}"
+    echo
+done
+
+
+#Run filtering command in terminal 
+chmod +x filter_samtools_all.sh
+./filter_samtools_all.sh
+
+
+
+##Log output files for filtering
+#Bash script 
+
+nano log_filtering.sh
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+LOG_DIR="${BASE}/logs/filtering"
+mkdir -p "${LOG_DIR}"
+
+for BAM in ${BASE}/filtered/*_filtered.bam; do
+  sample=$(basename "${BAM%_filtered.bam}")
+  samtools flagstat "${BAM}" > "${LOG_DIR}/${sample}_after.flagstat.txt"
+done
+
+#Run log_filtering command in terminal 
+chmod +x log_filtering.sh
+./log_filtering.sh
+
+
+
+
+### 5.EVALUATION OF THE LIBRARY COMPLEXITY USING THE ATACseqQC R PACKAGE. Checking how complex my Library is. Are there many PCR duplicates, do fragments keep bying shown over and over again?
+#This script need changes 
+
+# Performed using R 
+
+suppressPackageStartupMessages({
+  library(ATACseqQC)
+})
+
+# Paths and base directories
+
+base_dir <- "/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+bam_dir  <- file.path(base_dir, "filtered")
+out_dir  <- file.path(base_dir, "ATAC_sample_complexity_21_12_25")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -------------------------------
+# Get BAM files
+# -------------------------------
+bams <- list.files(
+  bam_dir,
+  pattern = "_filtered\\.bam$",
+  full.names = TRUE
+)
+
+stopifnot(length(bams) > 0)
+
+message("Found ", length(bams), " BAM files")
+
+# -------------------------------
+# Run complexity per sample
+# -------------------------------
+for (bam in bams) {
+
+  sample <- sub("_filtered\\.bam$", "", basename(bam))
+  message("Processing: ", sample)
+
+  pdf(
+    file = file.path(out_dir, paste0(sample, "_library_complexity.pdf")),
+    width = 11,
+    height = 8.5
+  )
+
+  tryCatch({
+    dupfreq <- readsDupFreq(bam)
+    estimateLibComplexity(dupfreq)
+  }, error = function(e) {
+    plot.new()
+    text(0.5, 0.5, paste("ERROR:", e$message))
+  })
+
+  dev.off()
+}
+
+message("All done.")
+message("PDFs saved in: ", out_dir)
+
+  
+
+
+
+
+
+### 6.Remove duplicates With Picard + sorting and indexing. Removing PCR duplicates on all filtered ATAC-seq Bam files.
+#Bash script 
+nano dedup_all.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+FILTER_DIR="${BASE}/filtered"
+DEDUP_DIR="${BASE}/dedup"
+TMP_DIR="${BASE}/tmp_picard"
+THREADS=6
+
+# Picard jar (from your find output; recommended choice)
+PICARD_JAR="/data/miniconda/share/picard-2.20.4-0/picard.jar"
+
+mkdir -p "${DEDUP_DIR}" "${TMP_DIR}"
+
+echo "Using Picard jar: ${PICARD_JAR}"
+echo "Using temp dir:   ${TMP_DIR}"
+echo
+
+for BAM in "${FILTER_DIR}"/*_filtered.bam; do
+  sample_base=$(basename "${BAM%_filtered.bam}")
+  UNSORTED="${DEDUP_DIR}/${sample_base}_dd_unsorted.bam"
+  SORTED="${DEDUP_DIR}/${sample_base}_dd_sorted.bam"
+  METRICS="${DEDUP_DIR}/${sample_base}_dup_metrics.txt"
+
+  echo ">>> MarkDuplicates ${sample_base}"
+
+  # If a previous run crashed, remove partial outputs
+  rm -f "${UNSORTED}" "${SORTED}" "${SORTED}.bai" "${METRICS}"
+
+  # Run Picard with temp redirected to /data (NOT /tmp)
+  java -Djava.io.tmpdir="${TMP_DIR}" -Xmx8g -jar "${PICARD_JAR}" MarkDuplicates \
+    INPUT="${BAM}" \
+    OUTPUT="${UNSORTED}" \
+    METRICS_FILE="${METRICS}" \
+    REMOVE_DUPLICATES=true \
+    TMP_DIR="${TMP_DIR}" \
+    VALIDATION_STRINGENCY=SILENT
+
+  samtools sort --threads "${THREADS}" -o "${SORTED}" "${UNSORTED}"
+  samtools index -@ "${THREADS}" "${SORTED}"
+  rm -f "${UNSORTED}"
+
+  echo ">>> Done ${sample_base}"
+  echo
+done
+
+#Run dedup_all command in terminal
+chmod +x dedup_all.sh
+./dedup_all.sh
+
+
+
+
+
+
+### 7.FastQC + MultiQC on deduplicated BAM files 
+#nano fastqc_dedup.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+DEDUP_DIR="${BASE}/dedup"
+DEDUP_QC_DIR="${BASE}/fastqc_dedup"
+
+# choose threads 
+THREADS=6
+
+mkdir -p "${DEDUP_QC_DIR}"
+
+# Run FastQC on deduplicated BAMs
+fastqc -t "${THREADS}" -o "${DEDUP_QC_DIR}" "${DEDUP_DIR}"/*_dd_sorted.bam
+
+# Summarize with MultiQC
+multiqc -o "${DEDUP_QC_DIR}" "${DEDUP_QC_DIR}"
+
+
+#Run fastqc_dedup.sh command in terminal
+chmod +x fastqc_dedup.sh
+./fastqc_dedup.sh
+
+
+
+
+
+### 8.REMOVAL OF READS MAPPING TO chrM, chrUn, random AND chrEBV 
+
+#Bash script 
+nano rm_chrM_Un_random_EBV.sh
+
+#RUN
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=6
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+DEDUP_DIR="${BASE}/dedup"
+CHR_DIR="${BASE}/normChr"
+mkdir -p "${CHR_DIR}"
+
+
+for BAM in "${DEDUP_DIR}"/*_dd_sorted.bam; do
+    sample_base=$(basename "${BAM%_dd_sorted.bam}")
+    OUT="${CHR_DIR}/${sample_base}_normChr.bam"
+
+    echo ">>> Removing chrM/chrUn/random/chrEBV for ${sample_base}"
+
+    samtools view -@ "${THREADS}" -h "${BAM}" \
+      | grep -v -E $'\tchrM\t|\tchrUn|\trandom|\tchrEBV' \
+      | samtools sort -@ "${THREADS}" -o "${OUT}" -
+
+    samtools index -@ "${THREADS}" "${OUT}"
+    samtools idxstats "${OUT}"  > "${CHR_DIR}/${sample_base}_normChr.idxstats"
+    samtools flagstat "${OUT}" > "${CHR_DIR}/${sample_base}_normChr.flagstat"
+
+    echo ">>> Done ${sample_base}"
+    echo
+done
+
+#Run rm_chrM_Un_random_EBV.sh command in terminal
+chmod +x rm_chrM_Un_random_EBV.sh
+./rm_chrM_Un_random_EBV.sh
+
+
+
+
+
+
+
+### 10. Compute chrM percentage before filtering. Check if removal of ChrM have come to 0 from the previous script. 
+
+# define base directory
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+
+# create output directory at project root
+mkdir -p "${BASE}/chrM_percentage_before_filtering"
+
+# compute chrM percentage BEFORE filtering
+(
+  echo -e "Sample\tchrM_percent"
+  for b in "${BASE}/dedup/"*_dd_sorted.bam; do
+    s=$(basename "$b" _dd_sorted.bam)
+    chrM=$(samtools idxstats "$b" | awk '$1=="chrM"{print $3}')
+    total=$(samtools idxstats "$b" | awk '{sum+=$3} END{print sum}')
+    awk -v s="$s" -v m="$chrM" -v t="$total" \
+      'BEGIN{printf "%s\t%.2f\n", s, (t>0 ? m/t*100 : 0)}'
+  done
+) > "${BASE}/chrM_percentage_before_filtering/chrM_percentage_before_filtering.tsv"
+
+
+
+
+
+
+
+
+### 11. Remove blacklist regions (BEDTools intersect) ##Download blacklist hg-38 bedfile in ENCODE 
+#Make bash script
+nano rm_blacklist_all.sh
+
+#RUN
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=6
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+CHR_DIR="${BASE}/normChr"
+BL_DIR="${BASE}/rmblacklist"
+BLACKLIST="/data/hg38-blacklist/hg38-blacklist.v2.bed"
+
+mkdir -p "${BL_DIR}"
+
+for BAM in "${CHR_DIR}"/*_normChr.bam; do
+  sample_base=$(basename "${BAM%_normChr.bam}")
+  OUT="${BL_DIR}/${sample_base}_rmblacklisted.bam"
+
+  echo ">>> Removing blacklist regions for ${sample_base}"
+
+  # BEFORE stats
+  samtools flagstat "${BAM}" > "${BL_DIR}/${sample_base}_before_blacklist.flagstat"
+
+  # Count reads overlapping blacklist
+  removed=$(bedtools intersect -abam "${BAM}" -b "${BLACKLIST}" -u | samtools view -c -)
+  echo "${removed}" > "${BL_DIR}/${sample_base}_blacklist_overlaps.count"
+
+  # Filter reads NOT overlapping blacklist
+  bedtools intersect -abam "${BAM}" -b "${BLACKLIST}" -v \
+    | samtools sort -@ "${THREADS}" -o "${OUT}" -
+
+  # Index 
+  samtools index -@ "${THREADS}" "${OUT}"
+  samtools flagstat "${OUT}" > "${BL_DIR}/${sample_base}_rmblacklisted.flagstat"
+
+  echo ">>> Done ${sample_base} — blacklist-overlapping reads removed: ${removed}"
+  echo
+done
+
+
+
+#Run bash script in terminal 
+chmod +x rm_blacklist_all.sh
+./rm_blacklist_all.sh
+
+
+
+
+
+
+
+
+### 12. ATACseqQC in R - fragment size and TSS enrichment 
+
+library(ATACseqQC)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(GenomicAlignments)
+
+base_dir <- "/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+bam_dir  <- file.path(base_dir, "rmblacklist")
+out_dir  <- file.path(base_dir, "TSS_enrichment_FragSizeDistribution")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# BAM files (post chrM + blacklist removal)
+bams <- list.files(
+  bam_dir,
+  pattern = "rmblacklisted.bam$",
+  full.names = TRUE
+)
+
+# Transcript annotations
+txs <- transcripts(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+# Fragment size distribution
+pdf(
+  file = file.path(out_dir, "ATAC_fragment_size_distribution_all_samples.pdf"),
+  width = 11,
+  height = 8.5
+)
+
+for (bam in bams) {
+  sample <- sub("_rmblacklisted.bam$", "", basename(bam))
+  message("Fragment size distribution: ", sample)
+  fragSizeDist(bam, sample)
+}
+
+dev.off()
+
+
+# TSS enrichment
+pdf(
+  file = file.path(out_dir, "ATAC_TSS_enrichment_all_samples.pdf"),
+  width = 11,
+  height = 8.5
+)
+
+for (bam in bams) {
+  sample <- sub("_rmblacklisted.bam$", "", basename(bam))
+  message("TSS enrichment: ", sample)
+
+  ga <- readGAlignments(bam)
+
+  # keep standard chromosomes only
+  ga <- ga[seqnames(ga) %in% c(paste0("chr", 1:22), "chrX", "chrY")]
+
+  tsse <- TSSEscore(ga, txs)
+
+  plot(
+    100 * (-9:10 - 0.5),
+    tsse$values,
+    type = "b",
+    main = sample,
+    xlab = "Distance to TSS (bp)",
+    ylab = "Aggregate TSS score"
+  )
+}
+
+dev.off()
+
+
+
+
+
+
+
+
+### 13. TN5 alignment (alignmentsieve) + sorting and indexing
+
+#Make bash script
+nano tshift_all.sh
+
+
+#RUN
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+THREADS=6
+BL_DIR="${BASE}/rmblacklist"
+SHIFT_DIR="${BASE}/shifted"
+TMP_DIR="${BASE}/tmp_deeptools"
+
+mkdir -p "${SHIFT_DIR}" "${TMP_DIR}"
+export TMPDIR="${TMP_DIR}"
+
+for BAM in "${BL_DIR}"/*_rmblacklisted.bam; do
+    sample_base=$(basename "${BAM%_rmblacklisted.bam}")
+    UNSORTED="${SHIFT_DIR}/${sample_base}_shifted_unsorted.bam"
+    SORTED="${SHIFT_DIR}/${sample_base}_shifted_sorted.bam"
+    METRICS="${SHIFT_DIR}/${sample_base}_shifted_metrics.txt"
+
+    echo ">>> Tn5 shifting ${sample_base}"
+
+    alignmentSieve --ATACshift -b "${BAM}" \
+        -o "${UNSORTED}" \
+        --filterMetrics "${METRICS}"
+
+    samtools sort --threads "${THREADS}" -o "${SORTED}" "${UNSORTED}"
+    samtools index -@ "${THREADS}" "${SORTED}"
+    rm "${UNSORTED}"
+
+    echo ">>> Done ${sample_base}"
+    echo
+done
+
+
+#Run bash script in terminal 
+chmod +x tshift_all.sh
+./tshift_all.sh
+
+
+
+
+
+
+
+
+### 14. MACS2 peak calling for all samples  
+##It will create 2 bedgraph files (bdg files), 1 control_lambda and 1 treat_pileup. For visualization use the treat_pileup since this is the observed read pileup, this is the actual chromatin Accessibility signal. 
+##Control_lambda_pileup is the local background model.	
+
+##Create MACS2 env on machine
+
+export CONDA_PKGS_DIRS=/data/conda_pkgs
+mkdir -p /data/conda_pkgs
+
+conda create -n macs2_src_env -c conda-forge -y \
+  python=3.11 pip cython numpy scipy
+
+conda activate macs2_src_env
+
+pip install --no-cache-dir MACS2==2.2.9.1
+
+macs2 --version
+python - << 'EOF'
+import MACS2
+print("MACS2 version:", MACS2.__version__)
+EOF
+
+
+#RUN
+
+cat > /data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/run_macs2.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Initialize conda for non-interactive shells
+source /data/miniconda/etc/profile.d/conda.sh
+conda activate macs2_src_env
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+SHIFT_DIR="${BASE}/shifted"
+MACS_DIR="${BASE}/macs2"
+mkdir -p "${MACS_DIR}"
+
+shopt -s nullglob
+bams=("${SHIFT_DIR}"/*_shifted_sorted.bam)
+
+if [ ${#bams[@]} -eq 0 ]; then
+  echo "ERROR: No BAMs matched: ${SHIFT_DIR}/*_shifted_sorted.bam"
+  echo "Files in ${SHIFT_DIR}:"
+  ls -lh "${SHIFT_DIR}" | head -50
+  exit 1
+fi
+
+for BAM in "${bams[@]}"; do
+  sample_base=$(basename "${BAM%_shifted_sorted.bam}")
+  NAME="${sample_base}.macs2"
+
+  echo ">>> MACS2 for ${sample_base}"
+  echo "    BAM: ${BAM}"
+
+  macs2 callpeak \
+    -t "${BAM}" \
+    -f BAMPE \
+    -g hs \
+    -n "${NAME}" \
+    --outdir "${MACS_DIR}" \
+    --shift -75 \
+    --extsize 150 \
+    --nomodel \
+    --call-summits \
+    --nolambda \
+    --keep-dup all \
+    -p 0.01 \
+    --bdg \
+done
+
+echo "Done. Outputs in: ${MACS_DIR}"
+EOF
+
+#Activate script 
+chmod +x /data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/run_macs2.sh
+
+/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/run_macs2.sh
+
+
+
+
+
+
+###15.Peak Count for all samples 
+
+#Run in terminal
+cd /data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/macs2
+
+for f in *_peaks.narrowPeak; do
+  echo -e "$(wc -l < "$f")\t$f"
+done | sort -n
+
+
+
+
+
+### 16. Convert from bedgraph files to bigwig files for better visualization in Browser Track. Do in Galaxy. Sorting is automatically done in Galaxy when converting. Use the bedgraph-bigwig in Galaxy. 
+## The main reason for convertion is for better scalability. The bedgraph files are indexed and sorted already so no need for doing this. No information is lost when converting. Remember to highlight the database which are used for the samples (hg38) 
+
+
+
+### 17. IGV browser track visualization
+##Insert all bigwig files in IGV. Remember to Group autoscale the replicates within the same condition. Highlight the different conditions by different colors. 
+
+
+
+
+
+### 18. ITERATIVE OVERLAP PEAK MERGING
+#The script is written by Jeff Granja and Ryan Corces and provided by the Corces Lab at the Gladstone Institutes of Neurological Disease and Data Science 
+and Biotechnology
+
+
+## Make metadata file (SAMPLE/GROUP). The file is saved as a txt file.
+
+#nano make_metadata.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# EDIT these paths if needed
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+MACS_DIR="${BASE}/macs2"
+
+cd "${MACS_DIR}"
+
+meta="${MACS_DIR}/metadata_atac.txt"
+echo -e "Sample\tGroup" > "${meta}"
+
+for f in *.macs2_summits.bed; do
+    # Remove the suffix -> gives you e.g. 1-PANC1-DMSO-1_S381_L002.macs2
+    sample=${f%_summits.bed}
+
+    # Decide group from the sample name
+    if [[ "$sample" == *DMSO* ]]; then
+        group="DMSO"
+    elif [[ "$sample" == *THZ531-2H* ]]; then
+        group="THZ2h"
+    elif [[ "$sample" == *THZ531-4H* ]]; then
+        group="THZ4h"
+    elif [[ "$sample" == *THZ531-6H* ]]; then
+        group="THZ6h"
+    else
+        echo "WARNING: could not assign group for $sample, setting to UNKNOWN" >&2
+        group="UNKNOWN"
+    fi
+
+    echo -e "${sample}\t${group}" >> "${meta}"
+done
+
+echo "Written metadata to ${meta}"
+cat "${meta}"
+
+#Run bash script 
+chmod +x make_metadata.sh
+./make_metadata.sh
+
+
+
+
+### Run createIterativeOverlapPeakSet.R for all 12 samples
+
+usr/bin/env bash
+set -u
+
+BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+MACS_DIR="${BASE}/macs2"
+BLACKLIST="/data/hg38-blacklist/hg38-blacklist.v2.bed"
+
+OUTDIR="${BASE}/IterativeOverlapMerged_peaks"
+mkdir -p "${OUTDIR}"
+
+Rscript /data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/Iterative_overlapp                                                                                                                                                                                               ing/createIterativeOverlapPeakSet.R \
+  --metadata "${MACS_DIR}/metadata_atac.txt" \
+  --macs2dir "${MACS_DIR}/" \
+  --outdir "${OUTDIR}" \
+  --suffix "_summits.bed" \
+  --blacklist "${BLACKLIST}" \
+  --genome hg38 \
+  --spm 5 \    
+  --rule "(n+1)/2" \
+  --extend 250
+
+
+
+##. What does the parameters mean
+--spm 5 → minimum of 2 samples With a score-per-million of 5. (you can relax this later if too strict). Even setting --spm 5, it applied min of 2 samples. That suggests this script version interprets the rule differently (likely per-group/replicate logic) or has an internal default overriding --spm based on group size. Check Readme in iterative_overlapping folder. 
+
+
+--rule "(n+1)/2" → (3+1)/2 = 2 -> peaks must overlap at least 2/3 replicates 
+
+--extend 250 → makes 500 bp windows centered on summits (±250)
