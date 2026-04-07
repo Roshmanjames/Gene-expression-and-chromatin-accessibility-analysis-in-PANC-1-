@@ -1,0 +1,593 @@
+#THZ531 
+```{r}
+# ============================================================
+# THZ531 dose-response plot from normalized values
+# - Mean ± SD from 3 replicates
+# - Sigmoidal fit on log10(concentration, M)
+# - DMSO plotted at 100 for presentation
+# - Separate legends for non-pancreatic and pancreatic cell lines
+# ============================================================
+
+# Install once if needed:
+# install.packages(c("readxl", "dplyr", "ggplot2", "purrr", "ggnewscale"))
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(ggnewscale)
+
+# -----------------------------
+# 1. Read file
+# -----------------------------
+file_path <- "THZ531_Dose_response.xlsx"
+raw <- read_excel(file_path, sheet = 1)
+colnames(raw)[1:2] <- c("dose_uM", "log_conc")
+
+raw <- raw %>%
+  mutate(
+    dose_uM  = as.character(dose_uM),
+    log_conc = as.numeric(log_conc)
+  )
+
+# -----------------------------
+# 2. Exact column layout
+# -----------------------------
+rep_groups <- list(
+  "Panc-1"     = colnames(raw)[3:5],
+  "Mia-Paca-2" = colnames(raw)[6:8],
+  "SW1990"     = colnames(raw)[9:11],
+  "Capan-2"    = colnames(raw)[12:14],
+  "Bx-PC-3"    = colnames(raw)[15:17],
+  "AsPC-1"     = colnames(raw)[18:20],
+  "Capan-1"    = colnames(raw)[21:23],
+  "HPAF-II"    = colnames(raw)[24:26],
+  "RPE-1"      = colnames(raw)[27:29],
+  "U2OS"       = colnames(raw)[30:32],
+  "HeLa"       = colnames(raw)[33:35]
+)
+
+# -----------------------------
+# 3. Mean ± SD from triplicates
+# -----------------------------
+summary_df <- map2_dfr(rep_groups, names(rep_groups), function(cols, cl) {
+  raw %>%
+    transmute(
+      dose_uM,
+      log_conc,
+      cell_line = cl,
+      mean_viability = rowMeans(across(all_of(cols)), na.rm = TRUE),
+      sd_viability   = apply(across(all_of(cols)), 1, sd, na.rm = TRUE)
+    )
+}) %>%
+  filter(!is.na(mean_viability), !is.na(log_conc))
+
+# Force DMSO points to 100 for plotting/presentation
+summary_df <- summary_df %>%
+  mutate(mean_viability = ifelse(dose_uM == "DMSO", 100, mean_viability))
+
+# -----------------------------
+# 4. Legend order, colors, shapes
+# -----------------------------
+legend_order <- c(
+  "RPE-1", "U2OS", "HeLa",
+  "Panc-1", "Mia-Paca-2", "SW1990", "Capan-2",
+  "Bx-PC-3", "AsPC-1", "Capan-1", "HPAF-II"
+)
+
+summary_df <- summary_df %>%
+  mutate(cell_line = factor(cell_line, levels = legend_order))
+
+cell_colors <- c(
+  "RPE-1"      = "#2647A3",
+  "U2OS"       = "#000000",
+  "HeLa"       = "#7A7A7A",
+  "Panc-1"     = "#CF2E2E",
+  "Mia-Paca-2" = "#E76F51",
+  "SW1990"     = "#F0A458",
+  "Capan-2"    = "#E67E22",
+  "Bx-PC-3"    = "#BC6C25",
+  "AsPC-1"     = "#D4D91F",
+  "Capan-1"    = "#C9D85A",
+  "HPAF-II"    = "#F1B96A"
+)
+
+cell_shapes <- c(
+  "RPE-1"      = 16,
+  "U2OS"       = 16,
+  "HeLa"       = 17,
+  "Panc-1"     = 16,
+  "Mia-Paca-2" = 18,
+  "SW1990"     = 16,
+  "Capan-2"    = 16,
+  "Bx-PC-3"    = 18,
+  "AsPC-1"     = 17,
+  "Capan-1"    = 17,
+  "HPAF-II"    = 18
+)
+
+non_pan <- c("RPE-1", "U2OS", "HeLa")
+pan <- c("Panc-1", "Mia-Paca-2", "SW1990", "Capan-2",
+         "Bx-PC-3", "AsPC-1", "Capan-1", "HPAF-II")
+
+# -----------------------------
+# 5. Fit curves
+#    Fit only real THZ531 doses, not DMSO
+#    Model: top fixed at 100, bottom fixed at 0
+# -----------------------------
+fit_df <- summary_df %>%
+  filter(dose_uM != "DMSO") %>%
+  filter(!is.na(log_conc), !is.na(mean_viability))
+
+fit_top100_bottom0 <- function(df) {
+  df <- df %>% arrange(log_conc)
+
+  start_logIC50 <- df$log_conc[which.min(abs(df$mean_viability - 50))][1]
+  if (is.na(start_logIC50)) {
+    start_logIC50 <- median(df$log_conc, na.rm = TRUE)
+  }
+
+  try(
+    nls(
+      mean_viability ~ 100 / (1 + 10^((log_conc - logIC50) * hill)),
+      data = df,
+      start = list(
+        logIC50 = start_logIC50,
+        hill    = 1
+      ),
+      algorithm = "port",
+      lower = c(logIC50 = min(df$log_conc) - 1, hill = 0.1),
+      upper = c(logIC50 = max(df$log_conc) + 1, hill = 3),
+      control = nls.control(maxiter = 500, warnOnly = TRUE)
+    ),
+    silent = TRUE
+  )
+}
+
+fit_list <- split(fit_df, fit_df$cell_line)
+fits <- purrr::map(fit_list, fit_top100_bottom0)
+
+curve_df <- purrr::imap_dfr(fits, function(fit, cl) {
+  if (inherits(fit, "try-error")) return(NULL)
+
+  xseq <- seq(-10, max(fit_df$log_conc, na.rm = TRUE), length.out = 400)
+  pred <- predict(fit, newdata = data.frame(log_conc = xseq))
+  pred <- pmin(pmax(pred, 0), 100)
+
+  tibble(
+    cell_line = factor(cl, levels = legend_order),
+    log_conc = xseq,
+    pred_viability = pred
+  )
+})
+
+# Split data for separate legends
+summary_non <- summary_df %>% filter(cell_line %in% non_pan)
+summary_pan <- summary_df %>% filter(cell_line %in% pan)
+
+curve_non <- curve_df %>% filter(cell_line %in% non_pan)
+curve_pan <- curve_df %>% filter(cell_line %in% pan)
+
+# -----------------------------
+# 6. Plot
+# -----------------------------
+p <- ggplot() +
+
+  # ---------- NON-PANCREATIC ----------
+  geom_line(
+    data = curve_non,
+    aes(x = log_conc, y = pred_viability, color = cell_line),
+    linewidth = 1.0
+  ) +
+  geom_errorbar(
+    data = summary_non,
+    aes(
+      x = log_conc,
+      ymin = mean_viability - sd_viability,
+      ymax = mean_viability + sd_viability,
+      color = cell_line
+    ),
+    width = 0.04,
+    linewidth = 0.55,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = summary_non,
+    aes(x = log_conc, y = mean_viability, color = cell_line, shape = cell_line),
+    size = 3.3,
+    stroke = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    name = "Non-pancreatic cancer cells",
+    values = cell_colors[non_pan],
+    breaks = non_pan,
+    guide = guide_legend(
+      order = 1,
+      override.aes = list(
+        shape = unname(cell_shapes[non_pan]),
+        linewidth = 1.4,
+        size = 4.5
+      )
+    )
+  ) +
+
+  ggnewscale::new_scale_color() +
+
+  # ---------- PANCREATIC ----------
+  geom_line(
+    data = curve_pan,
+    aes(x = log_conc, y = pred_viability, color = cell_line),
+    linewidth = 1.0
+  ) +
+  geom_errorbar(
+    data = summary_pan,
+    aes(
+      x = log_conc,
+      ymin = mean_viability - sd_viability,
+      ymax = mean_viability + sd_viability,
+      color = cell_line
+    ),
+    width = 0.04,
+    linewidth = 0.55,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = summary_pan,
+    aes(x = log_conc, y = mean_viability, color = cell_line, shape = cell_line),
+    size = 3.3,
+    stroke = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    name = "Pancreatic cancer cells",
+    values = cell_colors[pan],
+    breaks = pan,
+    guide = guide_legend(
+      order = 2,
+      override.aes = list(
+        shape = unname(cell_shapes[pan]),
+        linewidth = 1.4,
+        size = 4.5
+      )
+    )
+  ) +
+
+  scale_shape_manual(values = cell_shapes, guide = "none") +
+  geom_hline(
+    yintercept = 50,
+    linetype = "dotted",
+    linewidth = 0.8,
+    color = "black"
+  ) +
+  scale_x_continuous(
+    breaks = c(-10, -8, -6, -4),
+    limits = c(-10, -4)
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 50, 100),
+    limits = c(0, 102)
+  ) +
+  labs(
+    title = "Effect of THZ531 (CDK12/CDK13 inhibitor)",
+    x = "log(conc.)",
+    y = "Viable cells"
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    axis.line = element_line(linewidth = 1.8, color = "black"),
+    axis.ticks = element_line(linewidth = 1.5, color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
+    axis.title = element_text(size = 18, color = "black"),
+    plot.title = element_text(size = 24, face = "plain", hjust = 0.5),
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p)
+
+ggsave("THZ531_dose_response_grouped_legend.png", p, width = 11.5, height = 7, dpi = 300)
+ggsave("THZ531_dose_response_grouped_legend.pdf", p, width = 11.5, height = 7)
+```
+
+#NVP-2
+```{r}
+# ============================================================
+# NVP2 dose-response plot from normalized values
+# - Mean ± SD from 3 replicates
+# - Sigmoidal fit on log10(concentration, M)
+# - DMSO plotted at 100 for presentation
+# - Separate legends for non-pancreatic and pancreatic cell lines
+# ============================================================
+
+# Install once if needed:
+# install.packages(c("readxl", "dplyr", "ggplot2", "purrr", "ggnewscale"))
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(ggnewscale)
+
+# -----------------------------
+# 1. Read file
+# -----------------------------
+file_path <- "NVP2_Dose_response.xlsx"
+raw <- read_excel(file_path, sheet = 1)
+colnames(raw)[1:2] <- c("dose_nM", "log_conc")
+
+raw <- raw %>%
+  mutate(
+    dose_nM  = as.character(dose_nM),
+    log_conc = as.numeric(log_conc)
+  )
+
+# -----------------------------
+# 2. Exact column layout
+# -----------------------------
+rep_groups <- list(
+  "Panc-1"     = colnames(raw)[3:5],
+  "Mia-Paca-2" = colnames(raw)[6:8],
+  "SW1990"     = colnames(raw)[9:11],
+  "Capan-2"    = colnames(raw)[12:14],
+  "Bx-PC-3"    = colnames(raw)[15:17],
+  "AsPC-1"     = colnames(raw)[18:20],
+  "Capan-1"    = colnames(raw)[21:23],
+  "HPAF-II"    = colnames(raw)[24:26],
+  "RPE-1"      = colnames(raw)[27:29],
+  "U2OS"       = colnames(raw)[30:32],
+  "HeLa"       = colnames(raw)[33:35]
+)
+
+# -----------------------------
+# 3. Mean ± SD from triplicates
+# -----------------------------
+summary_df <- map2_dfr(rep_groups, names(rep_groups), function(cols, cl) {
+  raw %>%
+    transmute(
+      dose_nM,
+      log_conc,
+      cell_line = cl,
+      mean_viability = rowMeans(across(all_of(cols)), na.rm = TRUE),
+      sd_viability   = apply(across(all_of(cols)), 1, sd, na.rm = TRUE)
+    )
+}) %>%
+  filter(!is.na(mean_viability), !is.na(log_conc))
+
+# Force DMSO points to 100 for plotting/presentation
+summary_df <- summary_df %>%
+  mutate(mean_viability = ifelse(dose_nM == "DMSO", 100, mean_viability))
+
+# -----------------------------
+# 4. Legend order, colors, shapes
+# -----------------------------
+legend_order <- c(
+  "RPE-1", "U2OS", "HeLa",
+  "Panc-1", "Mia-Paca-2", "SW1990", "Capan-2",
+  "Bx-PC-3", "AsPC-1", "Capan-1", "HPAF-II"
+)
+
+summary_df <- summary_df %>%
+  mutate(cell_line = factor(cell_line, levels = legend_order))
+
+cell_colors <- c(
+  "RPE-1"      = "#2647A3",
+  "U2OS"       = "#000000",
+  "HeLa"       = "#7A7A7A",
+  "Panc-1"     = "#CF2E2E",
+  "Mia-Paca-2" = "#E76F51",
+  "SW1990"     = "#F0A458",
+  "Capan-2"    = "#E67E22",
+  "Bx-PC-3"    = "#BC6C25",
+  "AsPC-1"     = "#D4D91F",
+  "Capan-1"    = "#C9D85A",
+  "HPAF-II"    = "#F1B96A"
+)
+
+cell_shapes <- c(
+  "RPE-1"      = 16,
+  "U2OS"       = 16,
+  "HeLa"       = 17,
+  "Panc-1"     = 16,
+  "Mia-Paca-2" = 18,
+  "SW1990"     = 16,
+  "Capan-2"    = 16,
+  "Bx-PC-3"    = 18,
+  "AsPC-1"     = 17,
+  "Capan-1"    = 17,
+  "HPAF-II"    = 18
+)
+
+non_pan <- c("RPE-1", "U2OS", "HeLa")
+pan <- c("Panc-1", "Mia-Paca-2", "SW1990", "Capan-2",
+         "Bx-PC-3", "AsPC-1", "Capan-1", "HPAF-II")
+
+# -----------------------------
+# 5. Fit curves
+#    Fit only real NVP-2 doses, not DMSO
+#    Model: top fixed at 100, bottom fixed at 0
+# -----------------------------
+fit_df <- summary_df %>%
+  filter(dose_nM != "DMSO") %>%
+  filter(!is.na(log_conc), !is.na(mean_viability))
+
+fit_top100_bottom0 <- function(df) {
+  df <- df %>% arrange(log_conc)
+
+  start_logIC50 <- df$log_conc[which.min(abs(df$mean_viability - 50))][1]
+  if (is.na(start_logIC50)) {
+    start_logIC50 <- median(df$log_conc, na.rm = TRUE)
+  }
+
+  try(
+    nls(
+      mean_viability ~ 100 / (1 + 10^((log_conc - logIC50) * hill)),
+      data = df,
+      start = list(
+        logIC50 = start_logIC50,
+        hill    = 1
+      ),
+      algorithm = "port",
+      lower = c(logIC50 = min(df$log_conc) - 1, hill = 0.1),
+      upper = c(logIC50 = max(df$log_conc) + 1, hill = 3),
+      control = nls.control(maxiter = 500, warnOnly = TRUE)
+    ),
+    silent = TRUE
+  )
+}
+
+fit_list <- split(fit_df, fit_df$cell_line)
+fits <- purrr::map(fit_list, fit_top100_bottom0)
+
+curve_df <- purrr::imap_dfr(fits, function(fit, cl) {
+  if (inherits(fit, "try-error")) return(NULL)
+
+  xseq <- seq(-10, max(fit_df$log_conc, na.rm = TRUE), length.out = 400)
+  pred <- predict(fit, newdata = data.frame(log_conc = xseq))
+  pred <- pmin(pmax(pred, 0), 100)
+
+  tibble(
+    cell_line = factor(cl, levels = legend_order),
+    log_conc = xseq,
+    pred_viability = pred
+  )
+})
+
+# Split data for separate legends
+summary_non <- summary_df %>% filter(cell_line %in% non_pan)
+summary_pan <- summary_df %>% filter(cell_line %in% pan)
+
+curve_non <- curve_df %>% filter(cell_line %in% non_pan)
+curve_pan <- curve_df %>% filter(cell_line %in% pan)
+
+# -----------------------------
+# 6. Plot
+# -----------------------------
+p <- ggplot() +
+
+  # ---------- NON-PANCREATIC ----------
+  geom_line(
+    data = curve_non,
+    aes(x = log_conc, y = pred_viability, color = cell_line),
+    linewidth = 1.0
+  ) +
+  geom_errorbar(
+    data = summary_non,
+    aes(
+      x = log_conc,
+      ymin = mean_viability - sd_viability,
+      ymax = mean_viability + sd_viability,
+      color = cell_line
+    ),
+    width = 0.04,
+    linewidth = 0.55,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = summary_non,
+    aes(x = log_conc, y = mean_viability, color = cell_line, shape = cell_line),
+    size = 3.3,
+    stroke = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    name = "Non-pancreatic cancer cells",
+    values = cell_colors[non_pan],
+    breaks = non_pan,
+    guide = guide_legend(
+      order = 1,
+      override.aes = list(
+        shape = unname(cell_shapes[non_pan]),
+        linewidth = 1.4,
+        size = 4.5
+      )
+    )
+  ) +
+
+  ggnewscale::new_scale_color() +
+
+  # ---------- PANCREATIC ----------
+  geom_line(
+    data = curve_pan,
+    aes(x = log_conc, y = pred_viability, color = cell_line),
+    linewidth = 1.0
+  ) +
+  geom_errorbar(
+    data = summary_pan,
+    aes(
+      x = log_conc,
+      ymin = mean_viability - sd_viability,
+      ymax = mean_viability + sd_viability,
+      color = cell_line
+    ),
+    width = 0.04,
+    linewidth = 0.55,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    data = summary_pan,
+    aes(x = log_conc, y = mean_viability, color = cell_line, shape = cell_line),
+    size = 3.3,
+    stroke = 0.6,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    name = "Pancreatic cancer cells",
+    values = cell_colors[pan],
+    breaks = pan,
+    guide = guide_legend(
+      order = 2,
+      override.aes = list(
+        shape = unname(cell_shapes[pan]),
+        linewidth = 1.4,
+        size = 4.5
+      )
+    )
+  ) +
+
+  scale_shape_manual(values = cell_shapes, guide = "none") +
+  geom_hline(
+    yintercept = 50,
+    linetype = "dotted",
+    linewidth = 0.8,
+    color = "black"
+  ) +
+  scale_x_continuous(
+    breaks = c(-10, -8, -6, -4),
+    limits = c(-10, -4)
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 50, 100),
+    limits = c(0, 102)
+  ) +
+  labs(
+    title = "Effect of NVP-2 (CDK9 inhibitor)",
+    x = "log(conc.)",
+    y = "Viable cells"
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    axis.line = element_line(linewidth = 1.8, color = "black"),
+    axis.ticks = element_line(linewidth = 1.5, color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
+    axis.title = element_text(size = 18, color = "black"),
+    plot.title = element_text(size = 24, face = "plain", hjust = 0.5),
+    legend.position = "right",
+    legend.box = "vertical",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p)
+
+ggsave("NVP2_dose_response_grouped_legend.png", p, width = 11.5, height = 7, dpi = 300)
+ggsave("NVP2_dose_response_grouped_legend.pdf", p, width = 11.5, height = 7)
+
+```
