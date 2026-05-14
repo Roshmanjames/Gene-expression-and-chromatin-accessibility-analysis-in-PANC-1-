@@ -1,0 +1,1577 @@
+```{r}
+#!/usr/bin/env Rscript
+# =============================================================================
+#
+#  SLAMseq Analysis Pipeline — PANC-1 CDK12/13 Inhibition (THZ531)
+#
+#  Sections:
+#    0.  Configuration & global helpers
+#    1.  Alleyoop QC (mapping rate, T>C rates, substitution heatmap)
+#    2.  Count matrix construction from slamdunk tabular files
+#    3.  Extended QC of count matrices
+#    4.  DESeq2 differential expression (steady-state and nascent)
+#    5.  GO enrichment + Venn diagrams + 4-way pathway analysis
+#    6.  Nascent transcript subgrouping
+#    7.  Gene group enrichment (volcano overlays + Fisher OR)
+#    8.  TF target analysis (DoRothEA)
+#    9.  ATAC-seq metaplots at TSS
+#   10.  Gene regulatory network (PANDA)
+#
+#  Output: PNG (300 dpi) + TIFF (300 dpi, LZW) sized for Word A4 / 2.5 cm margins
+#
+#  PERFORMANCE CHANGES (vs original):
+#    - TX_MAP is built once then cached as tx_map_cache.rds; subsequent runs
+#      load it in ~2 s instead of 2-5 min.
+#    - build_tx_map() uses feature.type + colnames filtering so only transcript
+#      rows and three columns are parsed from the GTF on the first run.
+#    - Section 1 file-reading loops (mutation rates, overall rates, read
+#      positions) run in parallel via parallel::mclapply (Unix) or a PSOCK
+#      cluster (Windows).  NCORES is capped at 4 or detectCores()-1.
+#
+# =============================================================================
+
+# =============================================================================
+# 0. CONFIGURATION
+# =============================================================================
+CFG <- list(
+  wd          = "/data/SLAM",
+  stats_dir   = paste0("/data/SLAM/Results_SLAM_V1/",
+                 "72_ Alleyoop on dataset 25-49, 56-58, and 62-70_ Stats tables/",
+                 "Alleyoop on dataset 25-49, 56-58, and 62-70_ Stats tables"),
+  summary_dir = paste0("/data/SLAM/Results_SLAM_V1/",
+                 "71_ Alleyoop on dataset 25-49, 56-58, and 62-70_ Summary tables/",
+                 "Alleyoop on dataset 25-49, 56-58, and 62-70_ Summary tables"),
+  tabular_dir  = "/data/SLAM/CountTSV_SLAMDUNK_Feb2026",
+  gtf          = "/data/SLAM/Necessary_data/hg-38/gencode.v48.annotation.gtf.gz",
+  incorp_dir   = "/data/SLAM/Incorporation_Data",
+  outdir       = "/data/SLAM/Results_SLAM_V1",
+  steady_csv   = "Results_SLAM_V1/count_matrices/SLAMseq_steady_counts_ordered.csv",
+  nascent_csv  = "Results_SLAM_V1/count_matrices/SLAMseq_nascent_Tc_counts_ordered.csv",
+  # DE thresholds
+  padj_cut_nascent = 0.05,  lfc_cut_nascent = 1.0,
+  padj_cut_steady  = 0.10,  lfc_cut_steady  = 0.5,
+  # Subgroup thresholds
+  padj_most = 1e-5,  padj_less = 1e-2,
+  # GO
+  go_padj = 0.01,  go_N_nascent = 1000,  go_sources = "GO:BP",
+  # Figure sizes (cm) — A4 with 2.5 cm margins → 16 cm printable width
+  fig_w_full = 15,  fig_w_half = 10,
+  fig_h_std  = 9,   fig_h_tall = 12,
+  fig_dpi    = 300,
+  # DESeq2 branch
+  branches = list(B = list(
+    tag        = "THZ531",
+    regex      = "^(DMSO|THZ531-)",
+    ref        = "DMSO",
+    pairs      = list(c("THZ531-2h","DMSO"), c("THZ531-4h","DMSO"), c("THZ531-6h","DMSO")),
+    timepoints = c("2h","4h","6h")
+  ))
+)
+
+# =============================================================================
+# A. LIBRARIES
+# =============================================================================
+suppressPackageStartupMessages({
+  library(ggplot2);   library(dplyr);      library(tidyr)
+  library(readr);     library(stringr);    library(tibble)
+  library(viridis);   library(pheatmap);   library(RColorBrewer)
+  library(ggrepel);   library(purrr);      library(scales)
+  library(patchwork); library(DESeq2);     library(AnnotationDbi)
+  library(org.Hs.eg.db); library(apeglm); library(genefilter)
+  library(rtracklayer); library(EnhancedVolcano); library(readxl)
+  library(parallel)
+})
+
+HAS_GPROFILER <- requireNamespace("gprofiler2",  quietly = TRUE)
+HAS_VENN      <- requireNamespace("VennDiagram", quietly = TRUE)
+HAS_PANDA     <- requireNamespace("pandaR",      quietly = TRUE)
+HAS_DECOUPLER <- requireNamespace("decoupleR",   quietly = TRUE)
+
+# Explicit namespace — prevents Bioconductor packages overriding dplyr verbs
+select   <- dplyr::select;  filter  <- dplyr::filter;  rename  <- dplyr::rename
+slice    <- dplyr::slice;   count   <- dplyr::count;   arrange <- dplyr::arrange
+mutate   <- dplyr::mutate;  group_by <- dplyr::group_by; ungroup <- dplyr::ungroup
+
+setwd(CFG$wd)
+
+# =============================================================================
+# B. GLOBAL HELPERS
+# =============================================================================
+
+# ── Redirect R temp files to /data to protect the root filesystem ─────────────
+# /dev/sda1 (root) is small — writing Rtmp files there fills it up quickly.
+# Pointing TMPDIR to /data keeps all temp output on the large data drive.
+Sys.setenv(TMPDIR = "/data/tmp")
+dir.create("/data/tmp", showWarnings = FALSE, recursive = TRUE)
+
+# ── Parallel backend ──────────────────────────────────────────────────────────
+# mclapply (fork-based) hangs silently inside RStudio / knitr notebook chunks
+# on Linux. USE_PARALLEL = FALSE forces plain lapply which is reliable in all
+# environments. Set to TRUE only when running as a plain Rscript outside RStudio.
+USE_PARALLEL <- FALSE
+NCORES       <- min(4L, max(1L, parallel::detectCores() - 1L))
+IS_WINDOWS   <- .Platform$OS.type == "windows"
+
+par_lapply <- function(X, FUN, ...) {
+  if (!USE_PARALLEL || length(X) == 0) {
+    lapply(X, FUN, ...)
+  } else if (IS_WINDOWS) {
+    cl <- parallel::makeCluster(NCORES)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    parallel::parLapply(cl, X, FUN, ...)
+  } else {
+    parallel::mclapply(X, FUN, mc.cores = NCORES, ...)
+  }
+}
+
+# ── Safe null-filtering bind_rows ─────────────────────────────────────────────
+safe_bind <- function(lst) {
+  lst <- lst[!vapply(lst, is.null, logical(1))]
+  if (length(lst) == 0) return(tibble())
+  bind_rows(lst)
+}
+
+# ── Figure saving: PNG + TIFF ─────────────────────────────────────────────────
+save_fig <- function(p, base, w = CFG$fig_w_full, h = CFG$fig_h_std,
+                     dpi = CFG$fig_dpi) {
+  wi <- w / 2.54;  hi <- h / 2.54
+  ggsave(paste0(base, ".png"),  p, width = wi, height = hi, dpi = dpi)
+  ggsave(paste0(base, ".tiff"), p, width = wi, height = hi, dpi = dpi,
+         device = "tiff", compression = "lzw")
+  message("  Saved: ", basename(base))
+}
+
+# ── pheatmap: PNG + TIFF ──────────────────────────────────────────────────────
+save_heatmap <- function(mat, base, w = CFG$fig_w_full, h = CFG$fig_h_tall, ...) {
+  wi <- round(w / 2.54 * CFG$fig_dpi)
+  hi <- round(h / 2.54 * CFG$fig_dpi)
+  png( paste0(base, ".png"),  width = wi, height = hi, res = CFG$fig_dpi)
+  pheatmap(mat, ...); dev.off()
+  tiff(paste0(base, ".tiff"), width = wi, height = hi, res = CFG$fig_dpi,
+       compression = "lzw")
+  pheatmap(mat, ...); dev.off()
+  message("  Saved: ", basename(base))
+}
+
+# ── Directory creation ────────────────────────────────────────────────────────
+mkd <- function(...) {
+  p <- file.path(...)
+  dir.create(p, showWarnings = FALSE, recursive = TRUE)
+  p
+}
+
+# ── Shared colours ────────────────────────────────────────────────────────────
+GROUP_COLORS <- c(
+  "DMSO"      = "#888888", "THZ531-2h" = "#74add1",
+  "THZ531-4h" = "#2166ac", "THZ531-6h" = "#053061"
+)
+SAMPLE_COLORS <- c(
+  "DMSO rep1"="#3498db",       "DMSO rep2"="#2980b9",       "DMSO rep3"="#1a5276",
+  "THZ531 6H rep1"="#e74c3c",  "THZ531 6H rep2"="#c0392b",  "THZ531 6H rep3"="#922b21",
+  "THZ531 4H rep1"="#f39c12",  "THZ531 4H rep2"="#d68910",  "THZ531 4H rep3"="#b7770d",
+  "THZ531 2H rep1"="#27ae60",  "THZ531 2H rep2"="#1e8449",  "THZ531 2H rep3"="#196f3d"
+)
+
+THEME_PUB <- theme_classic(base_size = 11) +
+  theme(plot.title   = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 9, color = "grey40"),
+        axis.text.x  = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.title = element_text(face = "bold"),
+        panel.grid.major = element_line(color = "grey92", linewidth = 0.3),
+        panel.grid.minor = element_blank(),
+        plot.title.position = "plot")
+
+SAMPLE_LABELS <- c(
+  "dataset_13"="DMSO rep1",     "dataset_14"="DMSO rep2",     "dataset_15"="DMSO rep3",
+  "dataset_16"="THZ531 6H rep1","dataset_17"="THZ531 6H rep2","dataset_18"="THZ531 6H rep3",
+  "dataset_19"="THZ531 4H rep1","dataset_20"="THZ531 4H rep2","dataset_21"="THZ531 4H rep3",
+  "dataset_22"="THZ531 2H rep1","dataset_23"="THZ531 2H rep2","dataset_24"="THZ531 2H rep3"
+)
+rename_sample  <- function(x) ifelse(x %in% names(SAMPLE_LABELS), SAMPLE_LABELS[x], x)
+extract_sample <- function(f) str_extract(basename(f), "dataset_\\d+")
+
+# =============================================================================
+# C. ANNOTATION (GTF → ENST / SYMBOL map)
+#
+#  PERFORMANCE: The GTF is parsed only on the first run; the result is written
+#  to tx_map_cache.rds next to the GTF.  Every subsequent run loads the RDS
+#  (~2 s) instead of re-importing the full GTF (~2-5 min).
+#
+#  On the first run, build_tx_map() passes feature.type = "transcript" and a
+#  minimal colnames vector so rtracklayer skips all non-transcript rows and
+#  all unused metadata columns while parsing.
+# =============================================================================
+
+build_tx_map <- function(gtf_path) {
+  gtf <- rtracklayer::import(
+    gtf_path,
+    feature.type = "transcript",
+    colnames     = c("transcript_id", "gene_id", "gene_name")
+  )
+  df <- unique(data.frame(
+    ENST_FULL = as.character(mcols(gtf)$transcript_id),
+    ENSG      = as.character(mcols(gtf)$gene_id),
+    SYMBOL    = as.character(mcols(gtf)$gene_name),
+    stringsAsFactors = FALSE
+  ))
+  df$ENST_CORE <- sub("\\..*$", "", df$ENST_FULL)
+  df
+}
+
+TX_MAP_CACHE <- file.path(CFG$wd, "tx_map_cache.rds")
+
+if (file.exists(TX_MAP_CACHE)) {
+  message("Loading cached transcript annotation map (tx_map_cache.rds)…")
+  TX_MAP <- readRDS(TX_MAP_CACHE)
+} else {
+  message("Building transcript annotation map from GTF (first run — will be cached)…")
+  ptm    <- proc.time()
+  TX_MAP <- build_tx_map(CFG$gtf)
+  message(sprintf("  GTF import took %.1f s — saving cache for future runs",
+                  (proc.time() - ptm)[["elapsed"]]))
+  saveRDS(TX_MAP, TX_MAP_CACHE)
+}
+
+annotate_rows <- function(res_df) {
+  enst_core <- sub("\\..*$", "", str_extract(rownames(res_df), "ENST[0-9]+(\\.[0-9]+)?"))
+  idx  <- match(enst_core, TX_MAP$ENST_CORE)
+  out  <- as.data.frame(res_df, stringsAsFactors = FALSE)
+  out$ENST         <- enst_core
+  out$ENSEMBL_GENE <- TX_MAP$ENSG[idx]
+  out$SYMBOL       <- TX_MAP$SYMBOL[idx]
+  bad <- is.na(out$SYMBOL) | grepl("^(ENSG|ENST|NM_|XM_|NR_|XR_)", out$SYMBOL)
+  out$LABEL <- ifelse(bad, NA_character_, out$SYMBOL)
+  out
+}
+
+# =============================================================================
+# 1. QC FROM ALLEYOOP OUTPUT
+#
+#  PERFORMANCE: the three per-sample file-reading loops now use par_lapply()
+#  (mclapply on Unix, parLapply on Windows) so all files in each batch are
+#  read in parallel across up to NCORES workers.
+# =============================================================================
+message("\n========== Section 1: Alleyoop QC ==========\n")
+OUT1 <- mkd(CFG$outdir, "01_Alleyoop_QC")
+
+# 1.1  Mapping rate
+summary_df <- read_tsv(file.path(CFG$summary_dir, "summary.tabular"),
+                        comment = "#", show_col_types = FALSE) %>%
+  mutate(MappingRate = Mapped / Sequenced * 100,
+         Sample = rename_sample(str_extract(SampleName, "dataset_\\d+")))
+
+p <- ggplot(summary_df, aes(x = reorder(Sample, MappingRate),
+                             y = MappingRate, fill = SampleType)) +
+  geom_col() +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "firebrick", linewidth = .8) +
+  coord_flip() +
+  scale_fill_manual(values = c(pulse="#3498db", chase="#e74c3c", unlabeled="#95a5a6"),
+                    name = "Sample type") +
+  ylim(0, 100) +
+  labs(title = "Mapping Rate per Sample",
+       caption = "Red dashed line = 50% threshold", x = NULL, y = "Mapping Rate (%)") +
+  THEME_PUB + theme(axis.text.x = element_text(angle = 0, hjust = .5))
+save_fig(p, file.path(OUT1, "01_mapping_rate"), w = CFG$fig_w_full, h = CFG$fig_h_std)
+
+# 1.2  T>C conversion rate (UTR) — parallel file reads
+mut_files <- list.files(CFG$stats_dir, pattern = "mutationrates_utr.tabular$",
+                         full.names = TRUE)
+
+read_mutrates <- function(f) {
+  raw <- read_tsv(f, comment = "#", col_names = FALSE, show_col_types = FALSE)
+  colnames(raw) <- as.character(raw[1, ])
+  raw[-1, ] %>% mutate(across(c(ReadCount, T_C), as.numeric),
+                        Sample = rename_sample(extract_sample(f)))
+}
+
+message(sprintf("  Reading %d mutation-rate files across %d cores…",
+                length(mut_files), NCORES))
+mut_df <- safe_bind(par_lapply(mut_files, read_mutrates)) %>%
+  filter(ReadCount >= 10) %>%
+  mutate(TC_rate = T_C / ReadCount,
+         Sample  = factor(Sample, levels = SAMPLE_LABELS))
+
+p <- ggplot(mut_df, aes(x = Sample, y = TC_rate, fill = Sample)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = .15, alpha = .2, size = .5) +
+  coord_cartesian(ylim = c(0, quantile(mut_df$TC_rate, .99, na.rm = TRUE))) +
+  scale_fill_manual(values = SAMPLE_COLORS, guide = "none") +
+  labs(title    = "T>C Conversion Rate per Sample (3' UTR)",
+       subtitle = "Rate = T>C reads / Total reads | UTRs with ≥10 reads",
+       x = NULL, y = "T>C Conversion Rate") + THEME_PUB
+save_fig(p, file.path(OUT1, "02_TC_conversion_rate"), w = CFG$fig_w_full, h = CFG$fig_h_std)
+
+# 1.3  Mean T>C: DMSO vs THZ531 6H
+tc_summ <- mut_df %>%
+  mutate(Group = case_when(str_detect(Sample,"DMSO")~"DMSO",
+                            str_detect(Sample,"6H")~"THZ531 6H", TRUE~NA_character_)) %>%
+  filter(!is.na(Group)) %>%
+  group_by(Group) %>%
+  summarise(Mean_TC = mean(TC_rate, na.rm=TRUE), SD_TC = sd(TC_rate, na.rm=TRUE),
+            .groups = "drop") %>%
+  mutate(Group = factor(Group, levels = c("DMSO","THZ531 6H")))
+
+p <- ggplot(tc_summ, aes(x = Group, y = Mean_TC * 100, fill = Group)) +
+  geom_col(width = .55, color = "black", linewidth = .4) +
+  geom_errorbar(aes(ymin = (Mean_TC - SD_TC)*100, ymax = (Mean_TC + SD_TC)*100),
+                width = .18, linewidth = .7) +
+  scale_fill_manual(values = c("DMSO"="#888888","THZ531 6H"="#053061"), guide = "none") +
+  labs(title    = "Mean T>C Conversion Rate: DMSO vs THZ531 6H",
+       subtitle = "Bar = mean | Error bar = ±1 SD",
+       x = NULL, y = "Mean T>C Conversion Rate (%)") +
+  THEME_PUB + theme(axis.text.x = element_text(angle = 0, hjust = .5))
+save_fig(p, file.path(OUT1, "02b_mean_TC_DMSO_vs_6H"), w = CFG$fig_w_half, h = CFG$fig_h_std)
+
+# 1.4  Substitution rate heatmap — parallel file reads
+overall_files <- list.files(CFG$stats_dir, pattern = "overallrates.tabular$",
+                              full.names = TRUE)
+
+read_overall <- function(f) {
+  df <- read_tsv(f, comment = "#", col_names = FALSE, show_col_types = FALSE)
+  colnames(df) <- c("RefBase","A","a","C","c","G","g","T","t","N","n","extra")
+  df %>% filter(RefBase %in% c("A","C","G","T")) %>%
+    mutate(across(c(A,C,G,T,N), as.numeric),
+           Total  = A+C+G+T+N,
+           sub_AC = C/Total, sub_AG = G/Total, sub_AT = T/Total,
+           sub_CA = A/Total, sub_CG = G/Total, sub_CT = T/Total,
+           sub_GA = A/Total, sub_GC = C/Total, sub_GT = T/Total,
+           sub_TA = A/Total, sub_TC = C/Total, sub_TG = G/Total,
+           Sample = rename_sample(extract_sample(f)))
+}
+
+subst_codes  <- c(sub_AC="A>C",sub_AG="A>G",sub_AT="A>T",
+                   sub_CA="C>A",sub_CG="C>G",sub_CT="C>T",
+                   sub_GA="G>A",sub_GC="G>C",sub_GT="G>T",
+                   sub_TA="T>A",sub_TC="T>C",sub_TG="T>G")
+
+message(sprintf("  Reading %d overall-rate files across %d cores…",
+                length(overall_files), NCORES))
+overall_long <- safe_bind(par_lapply(overall_files, read_overall)) %>%
+  group_by(Sample) %>%
+  summarise(across(names(subst_codes), mean, na.rm=TRUE)) %>%
+  pivot_longer(-Sample, names_to="SubCode", values_to="Rate") %>%
+  mutate(Substitution = subst_codes[SubCode])
+
+p <- ggplot(overall_long, aes(x=Sample, y=Substitution, fill=Rate)) +
+  geom_tile(color="white", linewidth=.4) +
+  scale_fill_gradient(low="white", high="#c0392b", name="Rate") +
+  labs(title    = "Overall Nucleotide Substitution Rates per Sample",
+       subtitle = "T>C should dominate with successful 4sU labelling",
+       x = NULL, y = "Substitution type") + THEME_PUB
+save_fig(p, file.path(OUT1, "03_substitution_heatmap"), w = CFG$fig_w_full, h = CFG$fig_h_std)
+
+# 1.5  T>C per read position — parallel file reads
+readpos_files <- list.files(CFG$stats_dir, pattern = "tcperreadpos.tabular$",
+                              full.names = TRUE)
+
+read_readpos <- function(f) {
+  df <- read_tsv(f, comment="#", col_names=FALSE, show_col_types=FALSE)
+  colnames(df) <- c("TC_fwd","TC_rev","TC_norm_fwd","TC_norm_rev","total_fwd","total_rev")
+  df %>% mutate(Position = row_number(),
+                Rate_fwd = ifelse(total_fwd>0, TC_fwd/total_fwd, NA),
+                Rate_rev = ifelse(total_rev>0, TC_rev/total_rev, NA),
+                Sample   = rename_sample(extract_sample(f)))
+}
+
+message(sprintf("  Reading %d read-position files across %d cores…",
+                length(readpos_files), NCORES))
+readpos_long <- safe_bind(par_lapply(readpos_files, read_readpos)) %>%
+  select(Sample, Position, Rate_fwd, Rate_rev) %>%
+  pivot_longer(c(Rate_fwd,Rate_rev), names_to="Strand", values_to="TC_rate") %>%
+  mutate(Strand = ifelse(Strand=="Rate_fwd","Forward (+)","Reverse (-)"))
+
+p <- ggplot(readpos_long, aes(x=Position, y=TC_rate, color=Sample,
+                               group=interaction(Sample,Strand))) +
+  geom_line(alpha=.6, linewidth=.5) + facet_wrap(~Strand) +
+  scale_color_viridis_d(name="Sample") +
+  labs(title    = "T>C Conversion Rate per Read Position",
+       subtitle = "Flat curve = expected | Bias at ends = trimming issue",
+       x = "Read Position (bp)", y = "T>C Rate") +
+  THEME_PUB + theme(legend.text = element_text(size=7))
+save_fig(p, file.path(OUT1, "04_TC_per_read_position"), w = CFG$fig_w_full, h = CFG$fig_h_std)
+
+# =============================================================================
+# 2. COUNT MATRIX CONSTRUCTION
+# =============================================================================
+message("\n========== Section 2: Count Matrix Construction ==========\n")
+OUT2 <- mkd(CFG$outdir, "count_matrices")
+
+make_sample_id <- function(fname) {
+  bn <- tools::file_path_sans_ext(basename(fname))
+  bn <- str_replace(bn, "_([246])H_", "_\\1h_")
+  bn <- str_replace(bn, "^(THZ531)_([0-9]+h)_(\\d)$", "\\1-\\2_rep\\3")
+  bn <- str_replace(bn, "^(DMSO)_(\\d)$", "\\1_rep\\2")
+  bn
+}
+tab_files <- list.files(CFG$tabular_dir, pattern="\\.tabular$", full.names=TRUE)
+stopifnot(length(tab_files) == 12)
+names(tab_files) <- vapply(tab_files, make_sample_id, character(1))
+
+read_tabular <- function(path) {
+  lines <- readLines(path)
+  skip  <- sum(str_starts(lines, "#"))
+  df    <- read.table(path, header=TRUE, sep="\t", skip=skip,
+                      stringsAsFactors=FALSE, comment.char="")
+  df %>% select(Name, ReadCount, TcReadCount) %>% distinct(Name, .keep_all=TRUE)
+}
+
+steady_list  <- list()
+nascent_list <- list()
+for (sid in names(tab_files)) {
+  df <- read_tabular(tab_files[sid])
+  steady_list[[sid]]  <- setNames(df$ReadCount,   df$Name)
+  nascent_list[[sid]] <- setNames(df$TcReadCount, df$Name)
+}
+all_names <- Reduce(union, lapply(steady_list, names))
+
+build_mat <- function(lst, nm) {
+  mat <- matrix(0L, nrow=length(nm), ncol=length(lst),
+                dimnames=list(nm, names(lst)))
+  for (s in names(lst)) { v <- lst[[s]]; mat[names(v), s] <- as.integer(v) }
+  as.data.frame(mat, check.names=FALSE)
+}
+steady_mat  <- build_mat(steady_list,  all_names)
+nascent_mat <- build_mat(nascent_list, all_names)
+
+col_order <- c(paste0("DMSO_rep",1:3), paste0("THZ531-2h_rep",1:3),
+               paste0("THZ531-4h_rep",1:3), paste0("THZ531-6h_rep",1:3))
+col_order   <- intersect(col_order, colnames(steady_mat))
+steady_mat  <- steady_mat[,  col_order, drop=FALSE]
+nascent_mat <- nascent_mat[, col_order, drop=FALSE]
+
+write.csv(steady_mat,  file.path(OUT2, "SLAMseq_steady_counts_ordered.csv"),  quote=FALSE)
+write.csv(nascent_mat, file.path(OUT2, "SLAMseq_nascent_Tc_counts_ordered.csv"), quote=FALSE)
+message("Count matrices saved.")
+
+# =============================================================================
+# 3. EXTENDED QC
+# =============================================================================
+message("\n========== Section 3: Extended QC ==========\n")
+OUT3 <- mkd(CFG$outdir, "03_Extended_QC")
+
+nascent_qc <- read_csv(file.path(OUT2,"SLAMseq_nascent_Tc_counts_ordered.csv"),
+                        show_col_types=FALSE) %>% rename(gene=1)
+steady_qc  <- read_csv(file.path(OUT2,"SLAMseq_steady_counts_ordered.csv"),
+                        show_col_types=FALSE) %>% rename(gene=1)
+common_genes   <- intersect(nascent_qc$gene, steady_qc$gene)
+common_samples <- intersect(setdiff(colnames(nascent_qc),"gene"),
+                             setdiff(colnames(steady_qc), "gene"))
+nascent_qc <- nascent_qc %>% filter(gene %in% common_genes) %>% select(gene, all_of(common_samples))
+steady_qc  <- steady_qc  %>% filter(gene %in% common_genes) %>% select(gene, all_of(common_samples))
+
+parse_sample <- function(x) {
+  rep <- str_match(x,"(?i)rep\\s*([0-9]+)")[,2]
+  tx  <- ifelse(str_detect(x,"DMSO"),"DMSO",ifelse(str_detect(x,"THZ531"),"THZ531","OTHER"))
+  tp  <- str_match(x,"([0-9]+)\\s*h")[,2]
+  tp  <- ifelse(is.na(tp),"0h",paste0(tp,"h"))
+  # DMSO samples always get group = "DMSO" (no timepoint appended) so they
+  # match GROUP_COLORS["DMSO"] and display correctly in all plots/legends.
+  grp <- case_when(
+    tx == "DMSO"   ~ "DMSO",
+    tx == "THZ531" ~ paste0("THZ531-", tp),
+    TRUE           ~ paste0(tx, "-", tp)
+  )
+  tibble(sample=x, treatment=tx, time=tp, replicate=rep, group=grp)
+}
+meta_qc <- safe_bind(lapply(common_samples, parse_sample)) %>%
+  mutate(time  = factor(time, levels=c("0h","2h","4h","6h")),
+         group = factor(group, levels=names(GROUP_COLORS)))
+meta_qc$sample <- factor(meta_qc$sample,
+  levels=meta_qc$sample[order(meta_qc$treatment, meta_qc$time, meta_qc$replicate)])
+
+global_df <- tibble(
+  sample    = common_samples,
+  Tc_sum    = colSums(select(nascent_qc,-gene), na.rm=TRUE),
+  total_sum = colSums(select(steady_qc, -gene), na.rm=TRUE)) %>%
+  mutate(global_tc_rate = Tc_sum / pmax(total_sum,1)) %>%
+  left_join(meta_qc, by="sample") %>%
+  mutate(sample = factor(sample, levels=levels(meta_qc$sample)))
+
+p <- ggplot(global_df, aes(x=sample, y=global_tc_rate*100, fill=group)) +
+  geom_col() +
+  scale_fill_manual(values=GROUP_COLORS, name="Treatment group") +
+  labs(title="Global T>C Conversion Rate per Sample", x=NULL, y="Global T>C Rate (%)") +
+  THEME_PUB
+save_fig(p, file.path(OUT3,"QC01_global_TC_rate"))
+
+p <- ggplot(global_df, aes(x=sample, y=total_sum/1e6, fill=group)) +
+  geom_col() +
+  geom_hline(yintercept=mean(global_df$total_sum/1e6),
+             linetype="dashed", colour="firebrick", linewidth=.7) +
+  scale_fill_manual(values=GROUP_COLORS, name="Treatment group") +
+  labs(title="Library Size per Sample", subtitle="Red dashed = mean",
+       x=NULL, y="Total Reads (millions)") + THEME_PUB
+save_fig(p, file.path(OUT3,"QC02_library_size"))
+
+# PCA — nascent counts, clean sample labels
+mat_qc  <- nascent_qc %>% column_to_rownames("gene") %>% as.matrix()
+pca     <- prcomp(t(log1p(mat_qc)), center = TRUE, scale. = FALSE)
+var_exp <- (pca$sdev^2) / sum(pca$sdev^2)
+
+make_pca_label <- function(sample_id) {
+  sample_id <- as.character(sample_id)
+  rep_n <- str_extract(sample_id, "\\d+$")
+  case_when(
+    str_starts(sample_id, "DMSO")        ~ paste0("DMSO ", rep_n),
+    str_starts(sample_id, "THZ531-2h")   ~ paste0("THZ531 2H ", rep_n),
+    str_starts(sample_id, "THZ531-4h")   ~ paste0("THZ531 4H ", rep_n),
+    str_starts(sample_id, "THZ531-6h")   ~ paste0("THZ531 6H ", rep_n),
+    TRUE                                  ~ sample_id
+  )
+}
+
+pca_df <- as.data.frame(pca$x[, 1:2]) %>%
+  rownames_to_column("sample") %>%
+  left_join(meta_qc, by = "sample") %>%
+  mutate(label = make_pca_label(sample))
+
+p <- ggplot(pca_df, aes(PC1, PC2, colour = group)) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = GROUP_COLORS, name = "Treatment group") +
+  geom_text_repel(aes(label = label), size = 3, colour = "black", max.overlaps = Inf) +
+  labs(
+    title = "PCA — Nascent Counts (log1p)",
+    x     = paste0("PC1 (", round(var_exp[1] * 100, 1), "%)"),
+    y     = paste0("PC2 (", round(var_exp[2] * 100, 1), "%)")
+  ) +
+  theme_classic(base_size = 11) +
+  theme(plot.title       = element_text(face = "bold", size = 12),
+        legend.title     = element_text(face = "bold"))
+
+save_fig(p, file.path(OUT3, "QC03_PCA_nascent"), w = CFG$fig_w_half)
+
+# Pearson correlation heatmap — ordered DMSO, 2H, 4H, 6H (3 reps each)
+cor_mat <- cor(log1p(mat_qc), method = "pearson")
+
+sample_order <- c(
+  paste0("DMSO_rep",      1:3),
+  paste0("THZ531-2h_rep", 1:3),
+  paste0("THZ531-4h_rep", 1:3),
+  paste0("THZ531-6h_rep", 1:3)
+)
+sample_order <- intersect(sample_order, colnames(cor_mat))
+cor_mat_ord  <- cor_mat[sample_order, sample_order]
+
+ann_df_ord <- meta_qc %>%
+  filter(sample %in% sample_order) %>%
+  arrange(match(sample, sample_order)) %>%
+  select(sample, group) %>%
+  column_to_rownames("sample") %>%
+  as.data.frame()
+
+ann_colors <- list(group = GROUP_COLORS[intersect(names(GROUP_COLORS),
+                                                    unique(ann_df_ord$group))])
+
+save_heatmap(cor_mat_ord, file.path(OUT3, "QC04_correlation_heatmap"),
+             annotation_row    = ann_df_ord,
+             annotation_col    = ann_df_ord,
+             annotation_colors = ann_colors,
+             cluster_rows      = FALSE,   # order fixed: DMSO -> 2h -> 4h -> 6h, rep1-3
+             cluster_cols      = FALSE,   # order fixed: DMSO -> 2h -> 4h -> 6h, rep1-3
+             color             = colorRampPalette(c("#2166ac", "white", "#d73027"))(100),
+             breaks            = seq(.8, 1, length.out = 101),
+             display_numbers   = TRUE,
+             number_format     = "%.3f",
+             fontsize_number   = 7,
+             main              = "Pearson Correlation — log1p Nascent Counts",
+             border_color      = NA)
+
+# T>C rate over time
+time_df <- global_df %>% filter(treatment=="THZ531") %>% group_by(time) %>%
+  summarise(mean_rate=mean(global_tc_rate*100), sd_rate=sd(global_tc_rate*100), .groups="drop") %>%
+  mutate(time_num=as.numeric(str_extract(as.character(time),"[0-9]+")))
+dmso_mean <- mean(filter(global_df, treatment=="DMSO")$global_tc_rate*100)
+
+p <- ggplot(time_df, aes(x=time_num, y=mean_rate)) +
+  geom_hline(yintercept=dmso_mean, linetype="dashed", colour="#888888", linewidth=.8) +
+  geom_ribbon(aes(ymin=mean_rate-sd_rate, ymax=mean_rate+sd_rate), alpha=.2, fill="#2166ac") +
+  geom_line(colour="#2166ac", linewidth=1.2) + geom_point(colour="#2166ac", size=3) +
+  annotate("text", x=min(time_df$time_num), y=dmso_mean+.05,
+           label="DMSO mean", hjust=0, colour="#888888", size=3.5) +
+  scale_x_continuous(breaks=unique(time_df$time_num),
+                     labels=paste0(unique(time_df$time_num),"h")) +
+  labs(title="Mean Global T>C Rate over Time — THZ531",
+       subtitle="Ribbon = ±1 SD across replicates",
+       x="Time point", y="Mean Global T>C Rate (%)") +
+  theme_classic(base_size=11) + theme(plot.title=element_text(face="bold",size=12))
+save_fig(p, file.path(OUT3,"QC05_TC_rate_over_time"), w=CFG$fig_w_half)
+
+write_csv(global_df %>% select(sample,treatment,time,replicate,group,Tc_sum,total_sum,global_tc_rate) %>%
+            mutate(global_tc_pct=round(global_tc_rate*100,3)),
+          file.path(OUT3,"QC_summary_table.csv"))
+message("QC complete.")
+
+# =============================================================================
+# 4. DESeq2 DIFFERENTIAL EXPRESSION
+# =============================================================================
+message("\n========== Section 4: DESeq2 ==========\n")
+
+build_coldata <- function(ids) {
+  tibble(sample_id=ids) %>%
+    mutate(condition=case_when(str_starts(sample_id,"THZ531-2h")~"THZ531-2h",
+                                str_starts(sample_id,"THZ531-4h")~"THZ531-4h",
+                                str_starts(sample_id,"THZ531-6h")~"THZ531-6h",
+                                str_starts(sample_id,"DMSO")~"DMSO", TRUE~sample_id),
+           replicate=as.integer(str_extract(sample_id,"\\d+$")),
+           treatment=case_when(str_starts(sample_id,"DMSO")~"control",
+                               str_starts(sample_id,"THZ531")~"THZ531", TRUE~"other")) %>%
+    select(sample_id, condition, replicate, treatment)
+}
+
+get_coef <- function(dds, treat, ctrl) {
+  rn  <- resultsNames(dds)
+  pat <- paste0("^condition_", gsub("-","\\.",treat), "_vs_", gsub("-","\\.",ctrl), "$")
+  hit <- rn[grepl(pat, rn)]
+  if (length(hit)!=1) stop("Coeff not found: ",treat," vs ",ctrl)
+  hit
+}
+
+get_res_df <- function(dds, treat, ctrl) {
+  coef     <- get_coef(dds,treat,ctrl)
+  res_wald <- results(dds, contrast=c("condition",treat,ctrl),
+                      independentFiltering=FALSE, cooksCutoff=FALSE)
+  res_shr  <- lfcShrink(dds, coef=coef, type="apeglm")
+  df       <- as.data.frame(res_shr); df$padj <- res_wald$padj; df
+}
+
+get_thr <- function(is_nasc) {
+  if (is_nasc) list(padj=CFG$padj_cut_nascent, lfc=CFG$lfc_cut_nascent)
+  else         list(padj=CFG$padj_cut_steady,  lfc=CFG$lfc_cut_steady)
+}
+
+prefilter_tc <- function(cts, ids, min_tot=5, min_s=2) {
+  cs <- cts[,ids,drop=FALSE]
+  cts[rowSums(cs)>=min_tot & rowSums(cs>=1)>=min_s, ids, drop=FALSE]
+}
+
+compute_sf <- function(cts, coldata, regex, ref) {
+  keep <- grepl(regex, coldata$condition)
+  cd   <- droplevels(coldata[keep,,drop=FALSE]); rownames(cd) <- cd$sample_id
+  cs   <- cts[,cd$sample_id,drop=FALSE]
+  cd$condition <- relevel(factor(cd$condition), ref=ref)
+  dds  <- DESeqDataSetFromMatrix(cs, cd, design=~condition)
+  dds  <- estimateSizeFactors(dds)
+  sizeFactors(dds)
+}
+
+make_qc_deseq <- function(dds, tag, od) {
+  vsd      <- vst(dds, blind = FALSE)
+  mat_dist <- as.matrix(dist(t(assay(vsd))))
+
+  save_heatmap(mat_dist, file.path(od, paste0(tag, "_sample_distance")),
+               w = CFG$fig_w_half, h = CFG$fig_h_std,
+               cluster_rows = FALSE, cluster_cols = FALSE,
+               col  = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+               main = paste("Sample Distance —", tag))
+
+  pca_d   <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+  pv      <- round(100 * attr(pca_d, "percentVar"))
+
+  pca_d <- pca_d %>%
+    rownames_to_column("sample_id") %>%
+    mutate(
+      rep_n      = str_extract(sample_id, "\\d+$"),
+      pca_label  = case_when(
+        str_starts(sample_id, "DMSO")       ~ paste0("DMSO ", rep_n),
+        str_starts(sample_id, "THZ531-2h")  ~ paste0("THZ531 2H ", rep_n),
+        str_starts(sample_id, "THZ531-4h")  ~ paste0("THZ531 4H ", rep_n),
+        str_starts(sample_id, "THZ531-6h")  ~ paste0("THZ531 6H ", rep_n),
+        TRUE                                 ~ sample_id
+      )
+    )
+
+  p <- ggplot(pca_d, aes(PC1, PC2, color = condition, label = pca_label)) +
+    geom_point(size = 3) +
+    geom_text_repel(size = 2.8, color = "black", max.overlaps = 20) +
+    scale_color_manual(
+      values = c(DMSO        = GROUP_COLORS["DMSO"],
+                 `THZ531-2h` = GROUP_COLORS["THZ531-2h"],
+                 `THZ531-4h` = GROUP_COLORS["THZ531-4h"],
+                 `THZ531-6h` = GROUP_COLORS["THZ531-6h"]),
+      name = "Condition"
+    ) +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste("PCA —", tag),
+      x     = paste0("PC1: ", pv[1], "%"),
+      y     = paste0("PC2: ", pv[2], "%")
+    ) +
+    theme(plot.title = element_text(face = "bold", size = 12),
+          legend.title = element_text(face = "bold"))
+
+  save_fig(p, file.path(od, paste0(tag, "_PCA")), w = CFG$fig_w_half)
+}
+
+make_volcano <- function(res, treat, ctrl, tag, od, is_nasc, N=40) {
+  thr <- get_thr(is_nasc)
+  df  <- res %>% filter(is.finite(log2FoldChange), is.finite(padj))
+  pass <- !is.na(df$padj) & df$padj<thr$padj & abs(df$log2FoldChange)>=thr$lfc & !is.na(df$LABEL)
+  sel  <- df[pass,] %>% mutate(d=ifelse(log2FoldChange>0,"up","dn")) %>%
+    group_by(d) %>% slice_min(order_by=padj,n=N) %>% pull(LABEL) %>% unique()
+  xmax <- max(2, ceiling(quantile(abs(df$log2FoldChange),.995,na.rm=TRUE)))
+  v <- EnhancedVolcano(df, lab=ifelse(pass,df$LABEL,""), x="log2FoldChange", y="padj",
+         pCutoff=thr$padj, FCcutoff=thr$lfc, selectLab=sel, max.overlaps=400,
+         labSize=2.2, pointSize=1.2, title=sprintf("%s vs %s",treat,ctrl),
+         subtitle=sprintf("%s | apeglm LFC | top %d labelled",tag,N), ylim=c(0,80)) +
+    scale_x_continuous(limits=c(-xmax,xmax)) +
+    scale_y_continuous(breaks=c(0,20,40,60,80),limits=c(0,80))
+  save_fig(v, file.path(od,sprintf("%s_volcano_%s_vs_%s",tag,treat,ctrl)),
+           w=CFG$fig_w_full, h=CFG$fig_h_tall)
+}
+
+make_ma <- function(dds, treat, ctrl, tag, od, is_nasc) {
+  thr     <- get_thr(is_nasc)
+  coef    <- get_coef(dds,treat,ctrl)
+  rw      <- results(dds,contrast=c("condition",treat,ctrl),independentFiltering=FALSE,cooksCutoff=FALSE)
+  shr     <- lfcShrink(dds,coef=coef,type="apeglm"); shr$padj <- rw$padj
+  up_n    <- sum(!is.na(shr$padj)&shr$padj<thr$padj&shr$log2FoldChange>thr$lfc,  na.rm=TRUE)
+  dn_n    <- sum(!is.na(shr$padj)&shr$padj<thr$padj&shr$log2FoldChange<(-thr$lfc),na.rm=TRUE)
+  ttl     <- sprintf("%s: %s vs %s\nUp: %d | Down: %d",tag,treat,ctrl,up_n,dn_n)
+  base    <- file.path(od,sprintf("%s_MA_%s_vs_%s",tag,treat,ctrl))
+  wi <- round(CFG$fig_w_full/2.54*CFG$fig_dpi); hi <- round(CFG$fig_h_std/2.54*CFG$fig_dpi)
+  png( paste0(base,".png"),  width=wi, height=hi, res=CFG$fig_dpi)
+  DESeq2::plotMA(shr,ylim=c(-10,10),main=ttl)
+  abline(h=c(-thr$lfc,thr$lfc),lty=2,col="grey50"); dev.off()
+  tiff(paste0(base,".tiff"), width=wi, height=hi, res=CFG$fig_dpi, compression="lzw")
+  DESeq2::plotMA(shr,ylim=c(-10,10),main=ttl)
+  abline(h=c(-thr$lfc,thr$lfc),lty=2,col="grey50"); dev.off()
+}
+
+write_de_tables <- function(dds, treat, ctrl, tag, od) {
+  coef <- get_coef(dds,treat,ctrl)
+  rw   <- results(dds,contrast=c("condition",treat,ctrl),independentFiltering=FALSE,cooksCutoff=FALSE) %>%
+    as.data.frame() %>% annotate_rows() %>% arrange(padj,desc(abs(log2FoldChange)))
+  shr       <- lfcShrink(dds,coef=coef,type="apeglm") %>% as.data.frame()
+  shr$padj  <- results(dds,contrast=c("condition",treat,ctrl),independentFiltering=FALSE)$padj
+  shr       <- shr %>% annotate_rows() %>% arrange(padj,desc(abs(log2FoldChange)))
+  base <- file.path(od,sprintf("%s_DE_%s_vs_%s",tag,treat,ctrl))
+  write.csv(rw,  paste0(base,"_wald.csv"),   row.names=TRUE, quote=FALSE)
+  write.csv(shr, paste0(base,"_apeglm.csv"), row.names=TRUE, quote=FALSE)
+}
+
+run_branch <- function(cts, coldata, br, is_nasc=FALSE, ext_sf=NULL) {
+  tag <- br$tag; layer <- ifelse(is_nasc,"nascent","steady")
+  od  <- mkd(CFG$outdir, layer, tag)
+  keep    <- grepl(br$regex, coldata$condition)
+  cd      <- droplevels(coldata[keep,,drop=FALSE]); rownames(cd) <- cd$sample_id
+  ids     <- cd$sample_id
+  ct      <- cts[,ids,drop=FALSE]
+  if (is_nasc) ct <- prefilter_tc(ct, ids)
+  cd$condition <- relevel(factor(cd$condition), ref=br$ref)
+  dds <- DESeqDataSetFromMatrix(ct, cd, design=~condition)
+  dds <- dds[rowSums(counts(dds))>1,]
+  if (!is.null(ext_sf)) sizeFactors(dds) <- ext_sf[colnames(dds)]
+  else dds <- estimateSizeFactors(dds, type="poscounts")
+  dds <- DESeq(dds)
+  if (is_nasc && tag=="THZ531") saveRDS(dds, file.path(CFG$wd,"dds_thz_nascent.rds"))
+  write.csv(counts(dds,normalized=TRUE),
+            file.path(od,paste0(tag,"_",layer,"_counts_normalized.csv")), quote=FALSE)
+  make_qc_deseq(dds, paste(layer,tag,sep="_"), od)
+  for (pr in br$pairs) {
+    res <- get_res_df(dds,pr[1],pr[2]) %>% annotate_rows()
+    make_volcano(res, pr[1],pr[2], paste(layer,tag,sep="_"), od, is_nasc)
+    make_ma(dds, pr[1],pr[2], paste(layer,tag,sep="_"), od, is_nasc)
+    write_de_tables(dds, pr[1],pr[2], paste(layer,tag,sep="_"), od)
+  }
+  invisible(dds)
+}
+
+message("Loading count matrices…")
+steady_counts  <- read.csv(file.path(CFG$wd,CFG$steady_csv),  row.names=1, check.names=FALSE)
+nascent_counts <- read.csv(file.path(CFG$wd,CFG$nascent_csv), row.names=1, check.names=FALSE)
+coldata  <- build_coldata(colnames(steady_counts)); rownames(coldata) <- coldata$sample_id
+steady_counts  <- steady_counts[,  coldata$sample_id, drop=FALSE]
+nascent_counts <- nascent_counts[, coldata$sample_id, drop=FALSE]
+
+message("Computing size factors from steady-state…")
+sf_B <- compute_sf(steady_counts, coldata, CFG$branches$B$regex, CFG$branches$B$ref)
+
+message("DESeq2: Steady-state…"); run_branch(steady_counts,  coldata, CFG$branches$B, is_nasc=FALSE)
+message("DESeq2: Nascent…");      run_branch(nascent_counts, coldata, CFG$branches$B, is_nasc=TRUE, ext_sf=sf_B)
+
+# =============================================================================
+# 5. GO ENRICHMENT + VENN DIAGRAMS + PATHWAY ANALYSIS
+# =============================================================================
+message("\n========== Section 5: GO Enrichment & Venn Diagrams ==========\n")
+OUT5 <- mkd(CFG$outdir, "05_GO_Enrichment")
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+read_de_genes <- function(csv_path, direction="down",
+                           padj_cut=CFG$go_padj, lfc_cut=CFG$lfc_cut_nascent, top_n=NULL) {
+  if (!file.exists(csv_path)) { warning("Missing: ",csv_path); return(character(0)) }
+  df <- read.csv(csv_path, row.names=1, stringsAsFactors=FALSE) %>%
+    filter(!is.na(padj), is.finite(padj), !is.na(log2FoldChange), is.finite(log2FoldChange),
+           !is.na(SYMBOL), nzchar(SYMBOL), !grepl("^(ENSG|ENST|NM_|XM_|NR_|XR_)",SYMBOL),
+           padj < padj_cut)
+  df <- switch(direction,
+               up   = df %>% filter(log2FoldChange > 0),
+               down = df %>% filter(log2FoldChange < 0),
+               df)
+  if (!is.null(top_n)) df <- df %>% arrange(desc(abs(log2FoldChange))) %>% slice_head(n=top_n)
+  else                 df <- df %>% filter(abs(log2FoldChange) >= lfc_cut)
+  unique(df$SYMBOL)
+}
+
+run_gost <- function(genes, label, od, bg=NULL) {
+  if (length(genes)<5 || !HAS_GPROFILER) return(invisible(NULL))
+  library(gprofiler2)
+  g <- tryCatch(gost(query=genes, organism="hsapiens", sources=CFG$go_sources,
+                     correction_method="fdr", user_threshold=.05,
+                     evcodes=TRUE, custom_bg=bg),
+                error=function(e){ message("gost failed: ",e$message); NULL })
+  if (is.null(g)||is.null(g$result)||nrow(g$result)==0){
+    message("No GO:BP hits for: ",label); return(invisible(NULL)) }
+  res <- g$result
+  res[] <- lapply(res, function(col)
+    if (is.list(col)) vapply(col,function(x) paste(x,collapse=","),character(1)) else col)
+  write.csv(res, file.path(od,paste0(label,"_GO_BP.csv")), row.names=FALSE, quote=FALSE)
+  g
+}
+
+go_dotplot <- function(g_res, label, od, N=10, color_lo="#74add1", color_hi="#d73027") {
+  if (is.null(g_res)||is.null(g_res$result)) return(invisible(NULL))
+  df <- g_res$result %>% arrange(p_value) %>% slice_head(n=N) %>%
+    mutate(score      = -log10(p_value),
+           gene_ratio = intersection_size/query_size,
+           term_wrap  = str_wrap(term_name, width=40),
+           term_wrap  = factor(term_wrap, levels=rev(unique(term_wrap))))
+  p <- ggplot(df, aes(x=score, y=term_wrap, size=gene_ratio, color=score)) +
+    geom_point() +
+    scale_color_gradient(low=color_lo, high=color_hi, name="-log10\n(FDR)") +
+    scale_size_continuous(name="Gene\nRatio", range=c(2,8)) +
+    labs(title=str_wrap(label,55),
+         subtitle=sprintf("Top %d GO:BP pathways | n = %d genes",nrow(df),nrow(df)),
+         x="-log10(Adjusted P-value)", y=NULL) +
+    theme_classic(base_size=11) +
+    theme(plot.title=element_text(face="bold",size=10),
+          plot.subtitle=element_text(size=8,color="grey40"),
+          axis.text.y=element_text(size=8), legend.title=element_text(size=8),
+          legend.text=element_text(size=7))
+  save_fig(p, file.path(od,paste0(label,"_GO_top10")), w=CFG$fig_w_full, h=CFG$fig_h_tall)
+  invisible(p)
+}
+
+plot_venn <- function(gene_lists, labels, title, outfile, fill_colors=NULL) {
+  if (!HAS_VENN) return(invisible(NULL))
+  library(VennDiagram)
+  n <- length(gene_lists)
+  if (is.null(fill_colors))
+    fill_colors <- RColorBrewer::brewer.pal(max(3,n),"Set1")[1:n]
+  v <- venn.diagram(x=gene_lists, category.names=labels, filename=NULL,
+                    lty="blank", fill=fill_colors, cex=1.5, fontface="bold",
+                    fontfamily="sans", cat.cex=1.2, cat.fontface="bold",
+                    cat.fontfamily="sans", main=title, main.cex=1.4, main.fontface="bold")
+  wi <- round(CFG$fig_w_full/2.54*CFG$fig_dpi); hi <- round(CFG$fig_h_tall/2.54*CFG$fig_dpi)
+  png( paste0(outfile,".png"),  width=wi, height=hi, res=CFG$fig_dpi)
+  grid::grid.draw(v); dev.off()
+  tiff(paste0(outfile,".tiff"), width=wi, height=hi, res=CFG$fig_dpi, compression="lzw")
+  grid::grid.draw(v); dev.off()
+  message("  Saved: ", basename(outfile))
+}
+
+reduce_sets <- function(sets, mode=c("union","intersect")) {
+  mode <- match.arg(mode)
+  sets <- sets[vapply(sets, function(x) length(x)>0, logical(1))]
+  if (length(sets)==0) return(character(0))
+  if (length(sets)==1) return(unique(sets[[1]]))
+  if (mode=="union") unique(unlist(sets)) else Reduce(intersect, lapply(sets,unique))
+}
+
+# ── Main GO analysis function ─────────────────────────────────────────────────
+run_go_analysis <- function(branch_cfg) {
+  tag      <- branch_cfg$tag
+  tps      <- branch_cfg$timepoints
+  go_root  <- mkd(OUT5, tag)
+  venn_dir <- mkd(go_root, "Venn_diagrams")
+  ovl_dir  <- mkd(go_root, "Overlap_pathways")
+
+  store <- list(nascent_up=list(), nascent_down=list(),
+                steady_up =list(), steady_down =list())
+
+  # ── Per-timepoint GO ───────────────────────────────────────────────────────
+  for (tp in tps) {
+    message("  GO per timepoint: ", tag, " ", tp)
+    tp_dir <- mkd(go_root, tp)
+    cond   <- paste0(tag,"-",tp)
+    f_nas  <- file.path(CFG$outdir,"nascent",tag,
+                        sprintf("nascent_%s_DE_%s_vs_%s_apeglm.csv",tag,cond,branch_cfg$ref))
+    f_sst  <- file.path(CFG$outdir,"steady", tag,
+                        sprintf("steady_%s_DE_%s_vs_%s_apeglm.csv", tag,cond,branch_cfg$ref))
+
+    nas_up   <- read_de_genes(f_nas,"up",   top_n=CFG$go_N_nascent)
+    nas_down <- read_de_genes(f_nas,"down", top_n=CFG$go_N_nascent)
+    sst_up   <- read_de_genes(f_sst,"up",   lfc_cut=CFG$lfc_cut_steady,padj_cut=CFG$padj_cut_steady)
+    sst_down <- read_de_genes(f_sst,"down", lfc_cut=CFG$lfc_cut_steady,padj_cut=CFG$padj_cut_steady)
+
+    store$nascent_up[[tp]]   <- nas_up
+    store$nascent_down[[tp]] <- nas_down
+    store$steady_up[[tp]]    <- sst_up
+    store$steady_down[[tp]]  <- sst_down
+
+    combos_tp <- list(
+      list(g=nas_up,   lbl=paste0("Nascent_Up_",   tp), clo="#fee090", chi="#d73027"),
+      list(g=nas_down, lbl=paste0("Nascent_Down_", tp), clo="#74add1", chi="#2166ac"),
+      list(g=sst_up,   lbl=paste0("Steady_Up_",    tp), clo="#fdb863", chi="#e08214"),
+      list(g=sst_down, lbl=paste0("Steady_Down_",  tp), clo="#7fbf7b", chi="#1b7837"))
+    for (ci in combos_tp) {
+      gr <- run_gost(ci$g, ci$lbl, tp_dir)
+      go_dotplot(gr, ci$lbl, tp_dir, color_lo=ci$clo, color_hi=ci$chi)
+    }
+  }
+
+  # ── Venn: per layer+direction across timepoints ───────────────────────────
+  venn_specs <- list(
+    list(key="nascent_up",   layer="Nascent",      dir="Upregulated",   colors=c("#FC8D62","#8DA0CB","#66C2A5")),
+    list(key="nascent_down", layer="Nascent",      dir="Downregulated", colors=c("#FC8D62","#8DA0CB","#66C2A5")),
+    list(key="steady_up",    layer="Steady-state", dir="Upregulated",   colors=c("#FC8D62","#8DA0CB","#66C2A5")),
+    list(key="steady_down",  layer="Steady-state", dir="Downregulated", colors=c("#FC8D62","#8DA0CB","#66C2A5"))
+  )
+  for (vs in venn_specs) {
+    gl <- store[[vs$key]]
+    gl_ne <- gl[vapply(gl, function(x) length(x)>0, logical(1))]
+    if (length(gl_ne) < 2) next
+    plot_venn(gl_ne, labels=names(gl_ne),
+              title=sprintf("%s — %s %s\nacross timepoints", tag, vs$layer, vs$dir),
+              outfile=file.path(venn_dir, paste0(tag,"_",vs$key,"_Venn_timepoints")),
+              fill_colors=vs$colors[seq_along(gl_ne)])
+  }
+
+  # ── Venn: Nascent vs Steady-state ─────────────────────────────────────────
+  for (dir_lbl in c("up","down")) {
+    dir_title <- ifelse(dir_lbl=="up","Upregulated","Downregulated")
+    nas_union <- reduce_sets(store[[paste0("nascent_",dir_lbl)]], mode="union")
+    sst_union <- reduce_sets(store[[paste0("steady_", dir_lbl)]], mode="union")
+    if (length(nas_union)>0 && length(sst_union)>0) {
+      plot_venn(list(Nascent=nas_union, `Steady-state`=sst_union),
+                labels=c("Nascent","Steady-state"),
+                title=sprintf("%s %s — Nascent vs Steady-state\n(union across all timepoints)",
+                              tag, dir_title),
+                outfile=file.path(venn_dir,paste0(tag,"_NasVsSST_",dir_lbl,"_UNION")),
+                fill_colors=c("#E41A1C","#377EB8"))
+    }
+    nas_all <- reduce_sets(store[[paste0("nascent_",dir_lbl)]], mode="intersect")
+    sst_all <- reduce_sets(store[[paste0("steady_", dir_lbl)]], mode="intersect")
+    if (length(nas_all)>0 && length(sst_all)>0) {
+      plot_venn(list(Nascent=nas_all, `Steady-state`=sst_all),
+                labels=c("Nascent","Steady-state"),
+                title=sprintf("%s %s — Nascent vs Steady-state\n(genes DE in ALL timepoints)",
+                              tag, dir_title),
+                outfile=file.path(venn_dir,paste0(tag,"_NasVsSST_",dir_lbl,"_ALLTP")),
+                fill_colors=c("#4DAF4A","#984EA3"))
+    }
+  }
+
+  # ── Pathway enrichment: 4 independent analyses on intersection gene sets ──
+  message("  Pathway enrichment — 4 independent intersection analyses…")
+
+  pathway_combos <- list(
+    list(key="nascent_up",   label="Nascent — Upregulated in All Timepoints",
+         sub="Nascent_Up_AllTimepoints",   clo="#fee090", chi="#d73027"),
+    list(key="nascent_down", label="Nascent — Downregulated in All Timepoints",
+         sub="Nascent_Down_AllTimepoints", clo="#74add1", chi="#2166ac"),
+    list(key="steady_up",    label="Steady-state — Upregulated in All Timepoints",
+         sub="Steady_Up_AllTimepoints",    clo="#fdb863", chi="#e08214"),
+    list(key="steady_down",  label="Steady-state — Downregulated in All Timepoints",
+         sub="Steady_Down_AllTimepoints",  clo="#7fbf7b", chi="#1b7837")
+  )
+
+  go_panels <- list()
+
+  for (combo in pathway_combos) {
+    cd        <- mkd(ovl_dir, combo$sub)
+    genes_all <- reduce_sets(store[[combo$key]], mode="intersect")
+    message(sprintf("    %s: %d intersection genes", combo$label, length(genes_all)))
+
+    if (length(genes_all) == 0) {
+      message("    → No genes shared across all timepoints — skipping")
+      go_panels[[combo$sub]] <- NULL
+      next
+    }
+
+    writeLines(sort(unique(genes_all)), file.path(cd, paste0(combo$sub,"_genes.txt")))
+    g_res <- run_gost(genes_all, combo$sub, cd)
+
+    if (is.null(g_res) || is.null(g_res$result) || nrow(g_res$result)==0) {
+      message("    → No GO:BP hits")
+      go_panels[[combo$sub]] <- NULL
+      next
+    }
+
+    df_go <- g_res$result %>% arrange(p_value) %>% slice_head(n=10) %>%
+      mutate(score      = -log10(p_value),
+             gene_ratio = intersection_size / query_size,
+             term_wrap  = str_wrap(term_name, width=38),
+             term_wrap  = factor(term_wrap, levels=rev(unique(term_wrap))))
+
+    p_ind <- ggplot(df_go, aes(x=score, y=term_wrap, size=gene_ratio, color=score)) +
+      geom_point() +
+      scale_color_gradient(low=combo$clo, high=combo$chi, name="-log10\n(FDR)") +
+      scale_size_continuous(name="Gene\nRatio", range=c(2,8)) +
+      labs(title    = combo$label,
+           subtitle = sprintf("Top %d GO:BP | n = %d genes", nrow(df_go), length(genes_all)),
+           x = "-log10(Adjusted P-value)", y = NULL) +
+      theme_classic(base_size=10) +
+      theme(plot.title    = element_text(face="bold", size=9),
+            plot.subtitle = element_text(size=8, color="grey40"),
+            axis.text.y   = element_text(size=8),
+            legend.title  = element_text(size=7),
+            legend.text   = element_text(size=7))
+
+    save_fig(p_ind, file.path(cd, paste0(combo$sub,"_GO_top10")),
+             w=CFG$fig_w_full, h=CFG$fig_h_tall)
+    go_panels[[combo$sub]] <- p_ind
+  }
+
+  valid_panels <- go_panels[!vapply(go_panels, is.null, logical(1))]
+  if (length(valid_panels) >= 2) {
+    p_comb <- wrap_plots(valid_panels, ncol=2) +
+      plot_annotation(
+        title    = "GO:BP Pathway Enrichment — Genes DE in All Timepoints",
+        subtitle = sprintf("Intersection genes (2h ∩ 4h ∩ 6h) | 4 independent analyses | %s vs DMSO", tag),
+        theme    = theme(plot.title    = element_text(face="bold", size=13),
+                         plot.subtitle = element_text(size=9, color="grey40")))
+    save_fig(p_comb, file.path(ovl_dir, paste0(tag,"_GO_combined_4panel")),
+             w=CFG$fig_w_full * 1.3, h=CFG$fig_h_tall * 2)
+    message("  Saved combined 4-panel GO figure")
+  }
+
+  message("GO analysis complete for ", tag)
+}
+
+run_go_analysis(CFG$branches$B)
+
+# =============================================================================
+# 6. NASCENT TRANSCRIPT SUBGROUPING
+# =============================================================================
+message("\n========== Section 6: Nascent Subgrouping ==========\n")
+OUT6 <- mkd(CFG$outdir, "06_Nascent_Subgroups")
+
+run_subgrouping <- function(branch_cfg) {
+  tag <- branch_cfg$tag;  tps <- branch_cfg$timepoints
+  od  <- mkd(OUT6, tag)
+  SG  <- c("Most downregulated"="#d73027","Less downregulated"="#fee090","Not downregulated"="grey80")
+
+  for (tp in tps) {
+    f <- file.path(CFG$outdir,"nascent",tag,
+                   sprintf("nascent_%s_DE_%s-%s_vs_%s_wald.csv",tag,tag,tp,branch_cfg$ref))
+    if (!file.exists(f)){ message("Missing: ",f); next }
+
+    de <- read.csv(f, row.names=1, stringsAsFactors=FALSE)
+    de <- as.data.frame(lapply(de,function(x) if(is(x,"Rle")) as.vector(x) else x),
+                        stringsAsFactors=FALSE)
+    de_g <- de %>% filter(!is.na(SYMBOL),nzchar(SYMBOL)) %>%
+      mutate(SYMBOL=str_to_upper(SYMBOL)) %>%
+      group_by(SYMBOL) %>%
+      arrange(padj,desc(abs(log2FoldChange)),.by_group=TRUE) %>% slice(1) %>% ungroup() %>%
+      mutate(neglog10p = -log10(pmax(padj,.Machine$double.eps)),
+             subgroup  = case_when(
+               !is.na(padj)&padj<CFG$padj_most&log2FoldChange<=-CFG$lfc_cut_nascent ~"Most downregulated",
+               !is.na(padj)&padj>=CFG$padj_most&padj<CFG$padj_less&log2FoldChange<=-CFG$lfc_cut_nascent ~"Less downregulated",
+               TRUE~"Not downregulated"),
+             subgroup = factor(subgroup, levels=names(SG)))
+
+    pfx <- file.path(od, paste0(tag,"_",tp))
+    ttl <- sprintf("Nascent RNA (gene-level): THZ531-%s vs DMSO", tp)
+
+    cnt_lbl <- de_g %>% mutate(s=as.character(subgroup)) %>% count(s) %>%
+      { setNames(paste0(.$s," (n=",.$n,")"),.$s) }
+
+    p <- ggplot(de_g %>% arrange(subgroup=="Not downregulated"),
+                aes(x=log2FoldChange, y=neglog10p, color=subgroup, size=subgroup)) +
+      geom_point(alpha=.7,na.rm=TRUE) +
+      scale_color_manual(values=SG, labels=cnt_lbl, name=NULL) +
+      scale_size_manual(values=c("Most downregulated"=1.8,"Less downregulated"=1.4,"Not downregulated"=.6),
+                        guide="none") +
+      geom_hline(yintercept=c(-log10(CFG$padj_less),-log10(CFG$padj_most)),
+                 linetype="dashed",linewidth=.35,color="grey50") +
+      geom_vline(xintercept=c(-CFG$lfc_cut_nascent,CFG$lfc_cut_nascent),
+                 linetype="dashed",linewidth=.35,color="grey50") +
+      scale_x_continuous(limits=c(-10,10),oob=scales::squish) +
+      scale_y_continuous(limits=c(0,30),oob=scales::squish) +
+      labs(title=ttl, x="log2 Fold Change", y="-log10(Adjusted P-value)") +
+      theme_classic(base_size=11) +
+      theme(plot.title=element_text(face="bold",size=11), legend.position="right")
+    save_fig(p, paste0(pfx,"_subgroup_volcano"), w=CFG$fig_w_full, h=CFG$fig_h_tall)
+
+    ctab <- de_g %>% mutate(s=as.character(subgroup)) %>% count(s) %>%
+      mutate(s=factor(s,levels=names(SG)))
+    p2 <- ggplot(ctab, aes(x=s,y=n,fill=s)) +
+      geom_col(width=.6,show.legend=FALSE) +
+      geom_text(aes(label=n),vjust=-.4,size=3.5) +
+      scale_fill_manual(values=SG) +
+      scale_y_continuous(expand=expansion(mult=c(0,.12))) +
+      labs(title=ttl, x=NULL, y="Number of Genes") + THEME_PUB +
+      theme(axis.text.x=element_text(angle=20,hjust=1))
+    save_fig(p2, paste0(pfx,"_subgroup_counts"), w=CFG$fig_w_half)
+
+    write.csv(de_g, paste0(pfx,"_subgroups_gene_level.csv"), row.names=FALSE, quote=FALSE)
+    for (sg in levels(de_g$subgroup)) {
+      writeLines(sort(filter(de_g,subgroup==sg)$SYMBOL),
+                 paste0(pfx,"_",gsub(" ","_",sg),"_genes.txt"))
+    }
+    print(count(mutate(de_g,s=as.character(subgroup)),s))
+  }
+}
+run_subgrouping(CFG$branches$B)
+
+# =============================================================================
+# 7. GENE GROUP ENRICHMENT — VOLCANOS + FISHER OR
+# =============================================================================
+message("\n========== Section 7: Gene Group Enrichment ==========\n")
+OUT7 <- mkd(CFG$outdir, "07_Gene_Group_Enrichment")
+
+GENE_GROUPS <- list(
+  list(name="RPL",          label="RPL (Ribosomal Large Subunit)",      file="RPL_genes.xlsx",                              color="#E67E22",label_all=FALSE),
+  list(name="RPS",          label="RPS (Ribosomal Small Subunit)",       file="RPS_genes.xlsx",                              color="#F39C12",label_all=FALSE),
+  list(name="Histone",      label="Histone Genes",                       file="histone_genes.xlsx",                          color="#8E44AD",label_all=FALSE),
+  list(name="DDR",          label="DNA Damage Response",                 file="DDR_gene_list_from_screenshots.xlsx",          color="#7B3294",label_all=FALSE),
+  list(name="PARP",         label="PARP Sensitivity Genes (Lord 2016)", file="Parp_sensitivity_genes_Lord_2016.xlsx",        color="#C0392B",label_all=FALSE),
+  list(name="Pancreatic_TF",label="Pancreatic Transcription Factors",   file="Pancreatic_TF_V2_list_from_Petra.xlsx",       color="#1B9E77",label_all=TRUE),
+  list(name="Pancreatic_fate",label="Pancreatic Fate Markers",          file="Pancreatic_Fate_markers.xlsx",                 color="#2ECC71",label_all=TRUE),
+  list(name="PDAC_TF",      label="PDAC Transcription Factors",         file="PDAC_Transcription_Factors.xlsx",             color="#16A085",label_all=TRUE),
+  list(name="Housekeeping", label="Housekeeping Genes",                  file="housekeeping_genes.xlsx",                     color="#2980B9",label_all=FALSE),
+  list(name="CDK_CCN",      label="CDK/Cyclin Genes",                    file="CDK_CCN.xlsx",                                color="#E74C3C",label_all=FALSE),
+  list(name="BRCAness",     label="BRCAness Genes",                      file="BRCAness_genes.xlsx",                         color="#D35400",label_all=FALSE),
+  list(name="6TF_PANC",    label="6TF PANC-1 Gene Set",                 file="6TF_PANC-1.xlsx",                             color="#8E44AD",label_all=FALSE)
+)
+
+read_gene_list <- function(xlsx_path) {
+  if (!file.exists(xlsx_path)) return(character(0))
+  x <- tryCatch(suppressMessages(read_xlsx(xlsx_path,.name_repair="minimal")),
+                error=function(e) NULL)
+  if (is.null(x)||ncol(x)==0) return(character(0))
+  all_g <- character(0)
+  for (i in seq_len(min(ncol(x),3))) {
+    v <- toupper(str_trim(as.character(x[[i]])))
+    all_g <- c(all_g, v[!is.na(v)&nzchar(v)&v!="NA"&!grepl("^[0-9]+$",v)])
+  }
+  unique(all_g)
+}
+
+read_apeglm_csv <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  tryCatch({
+    df <- suppressMessages(read_csv(path, show_col_types=FALSE))
+    if ("...1" %in% names(df)) df <- rename(df, rowname=`...1`)
+    df %>% mutate(SYMBOL=toupper(as.character(SYMBOL)),
+                  log2FoldChange=as.numeric(log2FoldChange), padj=as.numeric(padj)) %>%
+      filter(is.finite(log2FoldChange), is.finite(padj), !is.na(SYMBOL), nzchar(SYMBOL))
+  }, error=function(e){ warning(e$message); NULL })
+}
+
+parse_apeglm_meta <- function(path) {
+  m <- str_match(basename(path), "^(.*)_DE_(.+?)_vs_(.+?)_apeglm\\.csv$")
+  if (any(is.na(m[1,2:4]))) return(NULL)
+  tibble(file=path,
+         branch=ifelse(grepl("/nascent/",path,ignore.case=TRUE),"NASCENT","STEADY"),
+         tag=m[1,2], treat=m[1,3], ctrl=m[1,4])
+}
+
+apeglm_files  <- list.files(CFG$outdir, pattern="_DE_.*_apeglm\\.csv$",
+                              recursive=TRUE, full.names=TRUE)
+meta_list_raw <- lapply(apeglm_files, parse_apeglm_meta)
+meta_gg       <- safe_bind(meta_list_raw)
+
+make_volcano_geneset <- function(df, gene_set, set_label, color_hex, title_str,
+                                  label_top_n=20, label_all=FALSE,
+                                  padj_cut=0.05, lfc_cut=1.0) {
+  df <- df %>% mutate(INSET=SYMBOL%in%gene_set, nl10p=-log10(padj),
+                      SIG=padj<padj_cut&abs(log2FoldChange)>=lfc_cut, SIG_INSET=INSET&SIG)
+  mf <- max(df$nl10p[is.finite(df$nl10p)], na.rm=TRUE); df$nl10p[!is.finite(df$nl10p)] <- mf
+
+  lab_df <- if (label_all) {
+    df %>% filter(INSET) %>% arrange(desc(nl10p),desc(abs(log2FoldChange))) %>%
+      distinct(SYMBOL,.keep_all=TRUE)
+  } else {
+    df %>% filter(SIG_INSET) %>% arrange(desc(nl10p),desc(abs(log2FoldChange))) %>%
+      distinct(SYMBOL,.keep_all=TRUE) %>% slice_head(n=label_top_n)
+  }
+  xmax <- max(2,ceiling(quantile(abs(df$log2FoldChange),.995,na.rm=TRUE)))
+  ymax <- max(10,ceiling(quantile(df$nl10p[is.finite(df$nl10p)],.995,na.rm=TRUE)))+2
+
+  ggplot(df, aes(log2FoldChange, nl10p)) +
+    geom_point(data=filter(df,!INSET), color="grey75",size=.4,alpha=.18) +
+    geom_point(data=filter(df,INSET&!SIG_INSET), shape=21,fill=color_hex,
+               color="black",stroke=.3,size=1.8,alpha=.65) +
+    geom_point(data=filter(df,SIG_INSET), shape=21,fill=color_hex,
+               color="black",stroke=.7,size=2.6,alpha=.95) +
+    geom_vline(xintercept=0, color="grey35",linewidth=.4) +
+    geom_vline(xintercept=c(-lfc_cut,lfc_cut), linetype="dashed",color="grey55",linewidth=.35) +
+    geom_hline(yintercept=-log10(padj_cut), linetype="dashed",color="grey55",linewidth=.35) +
+    geom_text_repel(data=lab_df,aes(label=SYMBOL),size=3.2,color="black",fontface="italic",
+                    box.padding=.4,max.overlaps=Inf,seed=42) +
+    coord_cartesian(xlim=c(-xmax,xmax),ylim=c(0,ymax)) +
+    labs(title=title_str,
+         subtitle=sprintf("%s: %d in set | %d significant",set_label,sum(df$INSET),sum(df$SIG_INSET)),
+         x="log2 Fold Change (apeglm)", y=expression(-log[10](p[adj]))) +
+    theme_classic(base_size=11) +
+    theme(plot.title=element_text(face="bold",size=11),
+          plot.subtitle=element_text(size=9,color="grey40"),legend.position="none")
+}
+
+for (grp in GENE_GROUPS) {
+  message("  Volcano overlay: ", grp$name)
+  genes   <- read_gene_list(file.path(CFG$incorp_dir, grp$file))
+  if (length(genes)==0) next
+  grp_dir <- mkd(OUT7, grp$name)
+
+  for (i in seq_len(nrow(meta_gg))) {
+    m  <- meta_gg[i,]; df <- read_apeglm_csv(m$file)
+    if (is.null(df)||nrow(df)==0||sum(genes%in%df$SYMBOL)==0) next
+    tp  <- str_match(m$treat,"THZ531-(\\d+h)")[,2]
+    ttl <- sprintf("%s\n%s vs %s (%s) | %s", grp$label, m$ctrl,
+                   ifelse(!is.na(tp),toupper(tp),m$treat), m$branch,
+                   ifelse(isTRUE(grp$label_all),"All members labelled",""))
+    p   <- make_volcano_geneset(df,genes,grp$label,grp$color,ttl,label_all=isTRUE(grp$label_all))
+    save_fig(p, file.path(grp_dir,sprintf("%s_%s_vs_%s_%s",grp$name,
+             gsub("[^A-Za-z0-9_]","_",m$treat),m$ctrl,m$branch)),
+             w=CFG$fig_w_full, h=CFG$fig_h_tall)
+  }
+}
+
+# ── Fisher OR heatmap ─────────────────────────────────────────────────────────
+OUT7F <- mkd(OUT7, "Fisher_OR")
+
+run_fisher_one <- function(df_gene, geneset, padj_cut=.05, lfc_cut=1.0) {
+  in_s <- df_gene$SYMBOL %in% geneset
+  aff  <- !is.na(df_gene$padj)&df_gene$padj<padj_cut&
+          !is.na(df_gene$log2FoldChange)&df_gene$log2FoldChange<=-lfc_cut
+  a <- sum(in_s&aff); b <- sum(in_s&!aff); c <- sum(!in_s&aff); d <- sum(!in_s&!aff)
+  if (a+b<3) return(NULL)
+  ft <- fisher.test(matrix(c(a,b,c,d),nrow=2,byrow=TRUE), alternative="greater")
+  tibble(n_set=a+b, n_affected=a, OR=unname(ft$estimate), p_value=ft$p.value)
+}
+
+collapse_sym <- function(df) {
+  df %>% mutate(r=ifelse(is.na(padj),Inf,padj)) %>%
+    group_by(SYMBOL) %>% arrange(r,.by_group=TRUE) %>%
+    slice(1) %>% ungroup() %>% select(-r)
+}
+
+fisher_meta_raw <- lapply(apeglm_files, parse_apeglm_meta)
+fisher_meta <- safe_bind(fisher_meta_raw) %>%
+  filter(grepl("^THZ531-",treat), ctrl=="DMSO") %>%
+  mutate(time_h=as.numeric(str_match(treat,"^THZ531-(\\d+)h$")[,2]),
+         comp=paste0(branch," ",time_h,"h vs DMSO")) %>%
+  arrange(factor(branch,levels=c("NASCENT","STEADY")), time_h)
+
+set_results <- pmap_dfr(
+  list(fisher_meta$branch,fisher_meta$treat,fisher_meta$ctrl,
+       fisher_meta$comp,fisher_meta$time_h,fisher_meta$file),
+  function(branch,treat,ctrl,comp,time_h,file) {
+    df <- read_apeglm_csv(file); if (is.null(df)) return(NULL)
+    df_g <- collapse_sym(df)
+    safe_bind(lapply(GENE_GROUPS, function(grp) {
+      gs  <- intersect(read_gene_list(file.path(CFG$incorp_dir,grp$file)), df_g$SYMBOL)
+      out <- run_fisher_one(df_g, gs)
+      if (is.null(out)) return(NULL)
+      tibble(branch,treat,ctrl,time_h,comp,group=grp$name) %>% bind_cols(out)
+    }))
+  }) %>% mutate(FDR=p.adjust(p_value,method="BH"))
+
+write_csv(set_results, file.path(OUT7F,"Fisher_OR_all_gene_sets.csv"))
+
+OR_cap <- 4
+
+plot_df_or <- set_results %>%
+  mutate(
+    comp    = factor(comp, levels = unique(fisher_meta$comp)),
+    group   = factor(group, levels = rev(vapply(GENE_GROUPS, `[[`, "name",
+                                                 FUN.VALUE = character(1)))),
+    OR_plot = pmin(OR, OR_cap),
+    sig_lab = case_when(FDR < .001 ~ "***", FDR < .01 ~ "**", FDR < .05 ~ "*", TRUE ~ ""),
+    tile_label = sprintf("OR %.2f\np %s%s",
+                          OR,
+                          ifelse(p_value < 1e-4, "<1e-4",
+                                 formatC(p_value, format = "f", digits = 4)),
+                          ifelse(sig_lab != "", paste0(" ", sig_lab), "")),
+    reliable = n_set >= 5
+  )
+
+p_or <- ggplot(plot_df_or, aes(x = comp, y = group, fill = OR_plot)) +
+  geom_tile(aes(alpha = reliable), color = "grey88", linewidth = .6) +
+  geom_text(aes(label = ifelse(reliable, tile_label, "n < 5")),
+            size = 2.4, lineheight = 1.2, color = "grey15") +
+  scale_fill_gradient(low = "grey85", high = "purple4",
+                      limits = c(0, OR_cap),
+                      breaks = c(0, 1, 2, 3, 4),
+                      labels = c("0", "1", "2", "3", paste0("≥", OR_cap)),
+                      name = "Odds Ratio") +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+  facet_grid(. ~ branch, scales = "free_x", space = "free_x") +
+  labs(
+    title    = "Gene Set Enrichment among THZ531-Downregulated Genes",
+    subtitle = sprintf("Fisher one-sided | padj < %.2g & log2FC ≤ −%.1f | tiles: OR + raw p-value",
+                       0.05, 1.0),
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid     = element_blank(),
+    axis.text.x    = element_text(angle = 35, hjust = 1),
+    strip.text     = element_text(face = "bold"),
+    plot.title     = element_text(face = "bold", size = 12),
+    plot.subtitle  = element_text(size = 9, color = "grey40")
+  )
+
+save_fig(p_or, file.path(OUT7F, "OR_heatmap_gene_sets"),
+         w = CFG$fig_w_full * 1.1, h = CFG$fig_h_tall)
+
+# =============================================================================
+# 8. TF TARGET ANALYSIS (DoRothEA)
+# =============================================================================
+message("\n========== Section 8: TF Target Analysis ==========\n")
+
+if (!HAS_DECOUPLER) {
+  message("decoupleR not installed — skipping.")
+} else {
+  library(decoupleR)
+  OUT8 <- mkd(CFG$outdir,"08_TF_Targets")
+  TFS  <- c("FOXA2","SOX9","SOX17","PDX1","HNF1B","HNF6")
+  TF_COL <- c(FOXA2="#E74C3C",SOX9="#3498DB",SOX17="#2ECC71",PDX1="#F39C12",
+               HNF1B="#9B59B6",HNF6="#1ABC9C")
+  RDS <- "/data/SLAM/dorothea_AB_regulon.rds"
+
+  if (file.exists(RDS)) {
+    regulon <- readRDS(RDS)
+  } else {
+    tmp <- tempfile(fileext=".rda")
+    download.file("https://raw.githubusercontent.com/saezlab/dorothea/master/data/dorothea_hs.rda",
+                  tmp,quiet=FALSE)
+    e <- new.env(); load(tmp,envir=e)
+    regulon <- e$dorothea_hs %>%
+      filter(confidence %in% c("A","B")) %>%
+      mutate(source=toupper(tf),target=toupper(target),mor=as.numeric(mor)) %>%
+      select(source,target,mor,confidence)
+    saveRDS(regulon,RDS)
+  }
+  if (!"source" %in% names(regulon) && "tf" %in% names(regulon))
+    regulon <- rename(regulon, source=tf)
+
+  tf_reg <- regulon %>% filter(source %in% TFS) %>%
+    mutate(source=toupper(source),target=toupper(target))
+
+  tfl_dir <- mkd(OUT8,"target_lists")
+  for (tf in TFS) {
+    tfd <- tf_reg %>% filter(source==tf); if (nrow(tfd)==0) next
+    writeLines(sort(unique(tfd$target)), file.path(tfl_dir,paste0(tf,"_targets.txt")))
+    write_csv(arrange(tfd,desc(abs(mor))), file.path(tfl_dir,paste0(tf,"_targets_mor.csv")))
+  }
+
+  for (tf in TFS) {
+    tfd <- tf_reg %>% filter(source==tf); if (nrow(tfd)==0) next
+    tf_dir <- mkd(OUT8,tf)
+    for (i in seq_len(nrow(fisher_meta))) {
+      m  <- fisher_meta[i,]
+      df <- read_apeglm_csv(m$file)
+      if (is.null(df)||sum(tfd$target %in% df$SYMBOL)==0) next
+      df2 <- df %>%
+        left_join(tfd %>% select(target,mor) %>% distinct(target,.keep_all=TRUE),
+                  by=c("SYMBOL"="target")) %>%
+        mutate(INSET=!is.na(mor),is_act=!is.na(mor)&mor>0,is_rep=!is.na(mor)&mor<0,
+               nl10p=-log10(padj), SIG=padj<.05&abs(log2FoldChange)>=1, SIG_INSET=INSET&SIG)
+      mf <- max(df2$nl10p[is.finite(df2$nl10p)],na.rm=TRUE)
+      df2$nl10p[!is.finite(df2$nl10p)] <- mf
+      lab <- df2 %>% filter(SIG_INSET) %>%
+        arrange(desc(abs(mor)),desc(nl10p)) %>% distinct(SYMBOL,.keep_all=TRUE) %>% slice_head(n=25)
+      tp  <- str_match(m$treat,"THZ531-(\\d+h)")[,2]
+      ttl <- sprintf("%s Targets — %s vs %s | %s", tf, m$ctrl,
+                     ifelse(!is.na(tp),toupper(tp),m$treat), m$branch)
+      xmax <- max(2,ceiling(quantile(abs(df2$log2FoldChange),.995,na.rm=TRUE)))
+      ymax <- max(10,ceiling(quantile(df2$nl10p[is.finite(df2$nl10p)],.995,na.rm=TRUE)))+2
+      p <- ggplot(df2,aes(log2FoldChange,nl10p)) +
+        geom_point(data=filter(df2,!INSET),color="grey75",size=.4,alpha=.18) +
+        geom_point(data=filter(df2,is_act&!SIG),shape=21,fill=alpha(TF_COL[tf],.45),
+                   color="grey50",stroke=.25,size=1.6,alpha=.6) +
+        geom_point(data=filter(df2,is_rep&!SIG),shape=25,fill=alpha(TF_COL[tf],.45),
+                   color="grey50",stroke=.25,size=1.6,alpha=.6) +
+        geom_point(data=filter(df2,is_act&SIG),shape=21,fill=TF_COL[tf],
+                   color="black",stroke=.7,size=2.6,alpha=.95) +
+        geom_point(data=filter(df2,is_rep&SIG),shape=25,fill=TF_COL[tf],
+                   color="black",stroke=.6,size=2.4,alpha=.9) +
+        geom_vline(xintercept=c(-1,0,1),linetype=c("dashed","solid","dashed"),
+                   color=c("grey55","grey35","grey55"),linewidth=.35) +
+        geom_hline(yintercept=-log10(.05),linetype="dashed",color="grey55",linewidth=.35) +
+        geom_text_repel(data=lab,aes(label=SYMBOL),size=3,color="black",fontface="italic",
+                        box.padding=.4,max.overlaps=Inf,seed=42) +
+        coord_cartesian(xlim=c(-xmax,xmax),ylim=c(0,ymax)) +
+        labs(title=ttl,
+             subtitle="● = Activated target (MoR>0)  ▼ = Repressed target (MoR<0)  Filled = significant",
+             x="log2 Fold Change (apeglm)", y=expression(-log[10](p[adj]))) +
+        theme_classic(base_size=11) +
+        theme(plot.title=element_text(face="bold",size=11),legend.position="none")
+      save_fig(p, file.path(tf_dir,sprintf("%s_%s_vs_%s_%s",tf,
+               gsub("[^A-Za-z0-9_]","_",m$treat),m$ctrl,m$branch)),
+               w=CFG$fig_w_full, h=CFG$fig_h_tall)
+    }
+  }
+  message("TF target analysis complete.")
+}
+
+# =============================================================================
+# 9. ATAC-seq METAPLOTS AT TSS (deepTools — requires conda environment)
+# =============================================================================
+message("\n========== Section 9: ATAC-seq Metaplots ==========\n")
+
+Sys.setenv(TMPDIR="/data/tmp"); dir.create("/data/tmp",recursive=TRUE,showWarnings=FALSE)
+ATAC_DIR     <- "/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/BigwigConverted_from_galaxy"
+SUB_DIR      <- file.path(CFG$outdir,"06_Nascent_Subgroups","THZ531")
+BED_DIR      <- mkd(SUB_DIR,"tss_beds")
+DT_DIR       <- mkd(SUB_DIR,"deeptools_output")
+DEEPTOOLS_BIN <- "/home/debian/.local/bin"
+Sys.setenv(PATH=paste(DEEPTOOLS_BIN,Sys.getenv("PATH"),sep=":"))
+
+message("  Building TSS coordinates from GTF…")
+gtf_g  <- rtracklayer::import(CFG$gtf, feature.type="gene",
+                               colnames=c("gene_id","gene_name"))
+tss_df <- as.data.frame(gtf_g) %>%
+  mutate(gene_symbol=str_to_upper(as.character(gene_name)),
+         seqnames=as.character(seqnames),
+         tss_pos=ifelse(strand=="+",start,end),
+         start_bed=tss_pos-1, end_bed=tss_pos, score=0,
+         lookup_key=ifelse(!is.na(gene_symbol)&nzchar(gene_symbol),gene_symbol,str_to_upper(gene_id))) %>%
+  select(seqnames,start_bed,end_bed,lookup_key,score,strand) %>%
+  distinct(lookup_key,.keep_all=TRUE)
+
+GRP_DEFS <- list(
+  list(name="Most_downregulated",  file_tag="Most_downregulated",  label="Most Downregulated"),
+  list(name="Less_downregulated",  file_tag="Less_downregulated",  label="Less Downregulated"),
+  list(name="Not_downregulated",   file_tag="Not_downregulated",   label="Not Downregulated")
+)
+for (tp in c("2h","4h","6h")) {
+  for (grp in GRP_DEFS) {
+    txt <- file.path(SUB_DIR, sprintf("THZ531_%s_%s_genes.txt",tp,grp$file_tag))
+    bed <- file.path(BED_DIR, sprintf("THZ531_%s_%s.bed",tp,grp$name))
+    if (!file.exists(txt)) next
+    genes <- str_to_upper(trimws(readLines(txt,warn=FALSE))); genes <- genes[nzchar(genes)]
+    b     <- tss_df %>% filter(lookup_key %in% genes) %>% distinct(lookup_key,.keep_all=TRUE)
+    if (nrow(b)==0) next
+    write.table(b, bed, sep="\t",quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+bw_files <- list.files(ATAC_DIR, pattern="\\.bigwig$|\\.bw$", full.names=TRUE)
+bw_meta  <- tibble(path=bw_files) %>%
+  mutate(fname=basename(path),
+         condition=case_when(str_detect(fname,regex("DMSO",  ignore_case=TRUE))~"DMSO",
+                             str_detect(fname,regex("THZ531",ignore_case=TRUE))~"THZ531",TRUE~"unknown"),
+         timepoint={ m <- str_match(fname,regex("_(\\d+)H_",ignore_case=TRUE))
+                     ifelse(is.na(m[,2]),"shared",paste0(tolower(m[,2]),"h")) },
+         rep=str_match(fname,"rep(\\d+)")[,2])
+
+do_atac <- function(tp) {
+  beds   <- vapply(GRP_DEFS, function(g)
+    { f <- file.path(BED_DIR,sprintf("THZ531_%s_%s.bed",tp,g$name)); ifelse(file.exists(f),f,NA_character_) },
+    character(1))
+  if (any(is.na(beds))) return(invisible(NULL))
+  bw_d  <- bw_meta %>% filter(condition=="DMSO") %>% arrange(rep) %>% pull(path)
+  bw_t  <- bw_meta %>% filter(condition=="THZ531", timepoint==tp|timepoint=="shared") %>% arrange(rep) %>% pull(path)
+  if (!length(bw_d)||!length(bw_t)) return(invisible(NULL))
+  all_bw  <- c(bw_d,bw_t)
+  all_lab <- c(paste0("DMSO_rep",seq_along(bw_d)), paste0("THZ531_",tp,"_rep",seq_along(bw_t)))
+  mat_f   <- file.path(DT_DIR,sprintf("ATAC_%s_matrix.gz",tp))
+  ht_f    <- file.path(DT_DIR,sprintf("ATAC_%s_heatmap.pdf",tp))
+  pf_f    <- file.path(DT_DIR,sprintf("ATAC_%s_profile.pdf",tp))
+  grp_str <- paste(vapply(GRP_DEFS,function(g) paste0('"',g$label,'"'),character(1)),collapse=" ")
+  if (system("which computeMatrix > /dev/null 2>&1")!=0){
+    message("  deepTools not found in PATH — skipping ATAC metaplots"); return(invisible(NULL)) }
+  system(sprintf("computeMatrix reference-point --referencePoint TSS -b 2000 -a 2000 -S %s -R %s --skipZeros -p 8 -o %s --samplesLabel %s",
+    paste(all_bw,collapse=" "), paste(beds,collapse=" "), mat_f, paste(all_lab,collapse=" ")))
+  system(sprintf("plotHeatmap -m %s -o %s --colorMap Blues --regionsLabel %s --whatToShow 'heatmap and colorbar' --plotTitle 'ATAC-seq at TSS | THZ531 %s vs DMSO' --heatmapHeight 15 --heatmapWidth 3 --dpi 300",
+    mat_f, ht_f, grp_str, tp))
+  system(sprintf("plotProfile -m %s -o %s --plotTitle 'ATAC Profile at TSS | THZ531 %s vs DMSO' --regionsLabel %s --perGroup --plotHeight 6 --plotWidth 8 --legendLocation lower-center --plotFileFormat pdf",
+    mat_f, pf_f, tp, grp_str))
+}
+for (tp in c("2h","4h","6h")) do_atac(tp)
+message("ATAC metaplots done.")
+
+# =============================================================================
+# 10. GENE REGULATORY NETWORK (PANDA) — optional
+# =============================================================================
+message("\n========== Section 10: PANDA GRN ==========\n")
+
+if (!HAS_PANDA) {
+  message("pandaR not installed — skipping GRN analysis.")
+} else {
+  library(pandaR)
+  OUT10     <- mkd(CFG$outdir,"10_GRN_PANDA")
+  MOTIF_F   <- file.path(OUT10,"data","motif_human.txt")
+  PPI_F     <- file.path(OUT10,"data","ppi_human.txt")
+  SAMPS_P   <- list(DMSO=paste0("DMSO_rep",1:3),
+                    "2h"=paste0("THZ531-2h_rep",1:3),
+                    "4h"=paste0("THZ531-4h_rep",1:3),
+                    "6h"=paste0("THZ531-6h_rep",1:3))
+
+  conv_sym <- function(mat) {
+    mat <- as.matrix(mat)
+    ec  <- sub("\\..*$","",str_extract(rownames(mat),"ENST[0-9]+\\.?[0-9]*"))
+    idx <- match(ec,TX_MAP$ENST_CORE); sym <- TX_MAP$SYMBOL[idx]
+    k   <- !is.na(sym)&nzchar(sym)
+    as.data.frame(mat[k,,drop=FALSE]) %>% mutate(SYMBOL=sym[k]) %>%
+      group_by(SYMBOL) %>% summarise(across(everything(),mean),.groups="drop") %>%
+      column_to_rownames("SYMBOL") %>% as.matrix()
+  }
+  nasc_sym <- conv_sym(nascent_counts)
+  sst_sym  <- conv_sym(steady_counts)
+
+  norm_expr <- function(nas,sst,sids) {
+    ns <- nas[,sids,drop=FALSE]; ss <- sst[,sids,drop=FALSE]
+    si <- round(ss[rowSums(round(ss))>1,,drop=FALSE])
+    storage.mode(si) <- "integer"
+    dds_s <- DESeqDataSetFromMatrix(si,data.frame(row.names=sids,c=rep("x",length(sids))),~1)
+    dds_s <- estimateSizeFactors(dds_s,type="poscounts"); sf <- sizeFactors(dds_s)
+    ns <- ns[rownames(ns)%in%rownames(si),,drop=FALSE]
+    nn <- sweep(ns,2,sf[colnames(ns)],"/"); nn <- nn[rowMeans(nn)>=1,,drop=FALSE]
+    ni <- round(nn); storage.mode(ni) <- "integer"
+    dds_n <- DESeqDataSetFromMatrix(ni,data.frame(row.names=sids,c=rep("x",length(sids))),~1)
+    sizeFactors(dds_n) <- sf[colnames(dds_n)]; assay(vst(dds_n,blind=TRUE))
+  }
+
+  if (!file.exists(MOTIF_F)||!file.exists(PPI_F)) {
+    message("  Motif/PPI files not found — using pandaToyData")
+    data(pandaToyData); motif_p <- pandaToyData$motif; ppi_p <- pandaToyData$ppi
+  } else {
+    motif_p <- read.table(MOTIF_F,header=FALSE,sep="\t",col.names=c("TF","Gene","score"),stringsAsFactors=FALSE)
+    ppi_p   <- read.table(PPI_F, header=FALSE,sep="\t",col.names=c("TF1","TF2","score"),stringsAsFactors=FALSE)
+  }
+
+  for (tp in names(SAMPS_P)) {
+    rds_f <- file.path(OUT10,tp,paste0("panda_",tp,".rds"))
+    tp_d  <- mkd(OUT10,tp)
+    if (!file.exists(rds_f)) {
+      message("  Running PANDA: ",tp)
+      em <- norm_expr(nasc_sym,sst_sym,SAMPS_P[[tp]])
+      r  <- panda(motif_p,as.data.frame(em),ppi_p,hamming=.001,progress=TRUE)
+      saveRDS(r,rds_f)
+      net <- r@regNet
+      write.csv(data.frame(TF=rep(rownames(net),ncol(net)),
+                            Gene=rep(colnames(net),each=nrow(net)),
+                            weight=as.vector(net)),
+                file.path(tp_d,paste0("edges_",tp,".csv")),row.names=FALSE,quote=FALSE)
+    } else { message("  PANDA cached: ",tp) }
+  }
+  message("PANDA GRN analysis complete.")
+}
+
+# =============================================================================
+# DONE
+# =============================================================================
+message("\n")
+message("================================================================")
+message("  SLAMseq Pipeline — COMPLETE")
+message("================================================================")
+message("  01_Alleyoop_QC/          Mapping rate, T>C rates, substitution")
+message("  count_matrices/          Steady-state and nascent count CSVs")
+message("  03_Extended_QC/          PCA, correlation, library size")
+message("  nascent/ & steady/       DESeq2 tables, volcanos, MA plots")
+message("  05_GO_Enrichment/        GO:BP, Venn diagrams, 4-way pathway")
+message("  06_Nascent_Subgroups/    Subgroup volcanos and gene lists")
+message("  07_Gene_Group_Enrichment/ Volcano overlays and Fisher OR")
+message("  08_TF_Targets/           DoRothEA TF target volcanos")
+message("  06_Nascent_Subgroups/.../deeptools_output/  ATAC metaplots")
+message("  10_GRN_PANDA/            PANDA regulatory networks")
+message("")
+message("  All figures: PNG (300 dpi) + TIFF (300 dpi, LZW)")
+message("  Width: 15 cm (A4, 2.5 cm margins)")
+message("================================================================")
+```
