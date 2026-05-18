@@ -1,0 +1,460 @@
+!/usr/bin/env Rscript
+# =============================================================================
+# ATAC-seq Figure Generation – THZ531 Timecourse (PANC1)
+#
+# Generates publication-ready figures for ATAC-seq differential accessibility
+# analysis, TF enrichment, and SLAM-seq integration from THZ531-treated PANC1
+# cells across 2h, 4h, and 6h timepoints.
+#
+# Figures produced:
+#   1.  DAR barplots         – all DARs and significant DARs (FDR < 0.1)
+#   2.  Distance-to-TSS      – dotplots for 4h and 6h DARs
+#   3.  DAR overlap heatmap  – genes with DARs at both 4h and 6h
+#   4.  Bias correction      – TF barplots before and after correction
+#   5.  TF activity heatmap  – decoupleR ULM scores across contrasts
+#   6.  Chi-square summary   – % most-downregulated genes and X2 statistics
+#
+# Dependencies: ggplot2, dplyr, tidyr, cowplot, pheatmap, tibble, readr
+# Output specs: 6.30-inch text width (A4), 300 DPI, 11pt base font
+#
+# Usage: Rscript ATAC_seq_figures.R
+#        (update path constants in the CONFIG section before running)
+# =============================================================================
+ 
+source("figure_settings.R")   # defines theme_word(), save_fig(), FIG_* constants
+ 
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(cowplot)
+  library(pheatmap)
+  library(tibble)
+  library(readr)
+})
+ 
+ 
+# =============================================================================
+# CONFIG – update these paths before running
+# =============================================================================
+ 
+BASE       <- "/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+DA_DIR     <- file.path(BASE, "DA_csaw_revised")
+ANN_DIR    <- file.path(BASE, "ChIPseeker_PeakAnnotation", "DARs")
+OUT_DAR    <- file.path(BASE, "DAR_gene_summary")
+UNIBIND    <- "/data/UniBind_TFBS_DATA_for_ATAC"
+ENRICH_DIR <- file.path(UNIBIND, "PANC1_62901_enrichment_corrected")
+DECOUPLE   <- file.path(UNIBIND, "TF_enrichment_decoupleR_62901", "plots")
+SUBGROUP   <- file.path(UNIBIND, "TF_target_subgroup_analysis", "plots")
+CHISQ_DIR  <- file.path(UNIBIND, "TF_target_subgroup_analysis", "Chisquare_plots")
+ 
+dir.create(CHISQ_DIR, showWarnings = FALSE, recursive = TRUE)
+ 
+ 
+# =============================================================================
+# 1. DAR BARPLOTS
+# Counts opened vs closed DARs per timepoint from csaw output files.
+# Panels A (all DARs) and B (significant DARs, FDR < 0.1) are saved
+# individually and as a combined two-panel figure.
+# =============================================================================
+ 
+# -- 1a. All DARs -------------------------------------------------------------
+ 
+dar_counts <- bind_rows(lapply(c("THZ2h", "THZ4h", "THZ6h"), function(tp) {
+  up   <- read.table(file.path(BASE, "DA_csaw",
+                               paste0(tp, "_vs_DMSO_csaw_up_all_DARs.txt")),
+                     header = TRUE)
+  down <- read.table(file.path(BASE, "DA_csaw",
+                               paste0(tp, "_vs_DMSO_csaw_down_all_DARs.txt")),
+                     header = TRUE)
+  tibble(Timepoint = tp,
+         Direction = c("Opened", "Closed"),
+         Count     = c(nrow(up), nrow(down)))
+})) %>%
+  mutate(Timepoint = factor(Timepoint,
+                            levels = c("THZ2h", "THZ4h", "THZ6h"),
+                            labels = c("2 h", "4 h", "6 h")))
+ 
+p_dar_all <- ggplot(dar_counts, aes(x = Timepoint, y = Count, fill = Direction)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = Count),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("Opened" = "#D73027", "Closed" = "#4575B4")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  theme_word() +
+  labs(title = "DARs following THZ531 treatment",
+       x     = "THZ531 treatment time",
+       y     = "Number of DARs",
+       fill  = NULL)
+ 
+save_fig(file.path(BASE, "DA_csaw", "DAR_counts_opened_vs_closed"),
+         p_dar_all, width = FIG_WIDTH_HALF * 1.3, height = FIG_H_SMALL)
+ 
+# -- 1b. Significant DARs (FDR < 0.1) ----------------------------------------
+ 
+sig_counts <- bind_rows(lapply(
+  list(c("THZ2h_vs_DMSO_csaw", "2 h"),
+       c("THZ4h_vs_DMSO_csaw", "4 h"),
+       c("THZ6h_vs_DMSO_csaw", "6 h")),
+  function(x) {
+    f  <- file.path(DA_DIR, paste0(x[1], "_DA-windows_significant.txt"))
+    df <- read.table(f, header = TRUE, sep = "\t")
+    df %>%
+      mutate(Direction = ifelse(logFC > 0, "Opened", "Closed")) %>%
+      count(Direction, name = "Count") %>%
+      mutate(Timepoint = x[2])
+  }
+)) %>%
+  complete(Timepoint = c("2 h", "4 h", "6 h"),
+           Direction = c("Opened", "Closed"),
+           fill = list(Count = 0)) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("2 h", "4 h", "6 h")),
+         Direction = factor(Direction, levels = c("Opened", "Closed")))
+ 
+p_dar_sig <- ggplot(sig_counts, aes(x = Timepoint, y = Count, fill = Direction)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = Count),
+            position = position_stack(vjust = 0.5),
+            color = "white", size = 3.5, fontface = "bold") +
+  scale_fill_manual(values = c("Opened" = "#D73027", "Closed" = "#4575B4")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08))) +
+  theme_word() +
+  labs(title = "Significant DARs (FDR < 0.1)",
+       x     = "THZ531 treatment time",
+       y     = "Number of significant DARs",
+       fill  = NULL)
+ 
+save_fig(file.path(DA_DIR, "Significant_DARs_opened_vs_closed"),
+         p_dar_sig, width = FIG_WIDTH_HALF * 1.3, height = FIG_H_SMALL)
+ 
+# -- 1c. Combined A/B panel ---------------------------------------------------
+ 
+combined_dar <- plot_grid(p_dar_all, p_dar_sig,
+                          ncol = 2, labels = c("A", "B"), label_size = 12)
+ 
+save_fig(file.path(DA_DIR, "DAR_barplots_combined"),
+         combined_dar, width = FIG_WIDTH_FULL, height = FIG_H_SMALL + 0.5)
+ 
+ 
+# =============================================================================
+# 2. DAR GENE DISTANCE-TO-TSS DOTPLOTS
+# Loads ChIPseeker-annotated DAR tables for 4h and 6h, assigns direction from
+# the csaw significant-windows files, and plots distance to TSS per gene.
+# Genes present at both timepoints are also shown as a tile overlap heatmap.
+# =============================================================================
+ 
+make_distTSS_plot <- function(data, timepoint_label) {
+  ggplot(data, aes(x = distanceToTSS / 1000,
+                   y = reorder(SYMBOL, distanceToTSS),
+                   color = Direction)) +
+    geom_vline(xintercept = 0, linetype = "dashed",
+               color = "grey60", linewidth = 0.5) +
+    geom_point(size = 2.5, alpha = 0.85) +
+    scale_color_manual(values = c("Opened" = "#D73027", "Closed" = "#4575B4")) +
+    coord_cartesian(xlim = c(-50, 50)) +
+    scale_y_discrete(expand = expansion(add = 1)) +
+    theme_word() +
+    theme(axis.text.y = element_text(size = 8, face = "italic")) +
+    labs(title = paste("Significant DARs –", timepoint_label, "vs DMSO"),
+         x     = "Distance to TSS (kb)",
+         y     = NULL,
+         color = "Direction")
+}
+ 
+# Load annotated DAR tables
+dar_4h <- read.table(file.path(ANN_DIR, "THZ_4H", "THZ_4H_All_DARs_annotated.tsv"),
+                     header = TRUE, sep = "\t")
+dar_6h <- read.table(file.path(ANN_DIR, "THZ_6H", "THZ_6H_All_DARs_annotated.tsv"),
+                     header = TRUE, sep = "\t")
+ 
+# Helper: attach DAR direction (up/down) from the significant-windows file
+add_direction <- function(dar_df, sig_file) {
+  sig     <- read.table(sig_file, header = TRUE, sep = "\t")
+  sig_key <- paste(sig$seqnames, sig$start, sig$end, sep = "_")
+  dar_key <- paste(dar_df$seqnames, dar_df$start, dar_df$end, sep = "_")
+  dar_df$direction <- sig$direction[match(dar_key, sig_key)]
+  dar_df
+}
+ 
+dar_4h <- add_direction(dar_4h,
+  file.path(DA_DIR, "THZ4h_vs_DMSO_csaw_DA-windows_significant.txt"))
+dar_6h <- add_direction(dar_6h,
+  file.path(DA_DIR, "THZ6h_vs_DMSO_csaw_DA-windows_significant.txt"))
+ 
+overlapp <- intersect(dar_4h$SYMBOL, dar_6h$SYMBOL)
+ 
+combine_dar <- function(df, tp) {
+  df %>%
+    filter(!is.na(SYMBOL), !is.na(distanceToTSS)) %>%
+    mutate(Direction = ifelse(direction == "up", "Opened", "Closed"),
+           Timepoint = tp)
+}
+ 
+combined_dist <- bind_rows(combine_dar(dar_4h, "4h"),
+                           combine_dar(dar_6h, "6h"))
+ 
+p_dist_4h <- make_distTSS_plot(combined_dist %>% filter(Timepoint == "4h"), "THZ531 4h")
+p_dist_6h <- make_distTSS_plot(combined_dist %>% filter(Timepoint == "6h"), "THZ531 6h")
+ 
+n_genes_4h <- n_distinct(combined_dist %>% filter(Timepoint == "4h") %>% pull(SYMBOL))
+n_genes_6h <- n_distinct(combined_dist %>% filter(Timepoint == "6h") %>% pull(SYMBOL))
+ 
+save_fig(file.path(OUT_DAR, "DAR_genes_distToTSS_4h"), p_dist_4h,
+         width  = FIG_WIDTH_FULL,
+         height = max(FIG_H_SMALL, n_genes_4h * 0.18 + 1))
+ 
+save_fig(file.path(OUT_DAR, "DAR_genes_distToTSS_6h"), p_dist_6h,
+         width  = FIG_WIDTH_FULL,
+         height = max(FIG_H_SMALL, n_genes_6h * 0.18 + 1))
+ 
+# -- Overlap tile heatmap: genes with DARs at both timepoints -----------------
+ 
+overlap_df <- combined_dist %>%
+  filter(SYMBOL %in% overlapp) %>%
+  mutate(Timepoint = factor(Timepoint, levels = c("4h", "6h")))
+ 
+p_overlap <- ggplot(overlap_df,
+                    aes(x = Timepoint, y = SYMBOL, fill = Direction)) +
+  geom_tile(color = "white", linewidth = 0.6, width = 0.55, height = 0.7) +
+  scale_fill_manual(values = c("Opened" = "#D73027", "Closed" = "#4575B4")) +
+  theme_word() +
+  theme(axis.text.y = element_text(size = 9, face = "italic")) +
+  labs(title    = "Genes with DARs at both 4h and 6h",
+       subtitle = "Consistent chromatin changes after THZ531",
+       x        = "Timepoint",
+       y        = NULL,
+       fill     = "Direction")
+ 
+save_fig(file.path(OUT_DAR, "DAR_genes_overlap_heatmap"), p_overlap,
+         width  = FIG_WIDTH_HALF * 1.1,
+         height = max(FIG_H_SMALL, length(overlapp) * 0.22 + 1))
+ 
+ 
+# =============================================================================
+# 3. TF BIAS CORRECTION BARPLOTS
+# Compares the top 30 TFs ranked by raw binding-site count (before correction)
+# vs enrichment ratio = ATAC sites / total UniBind sites (after correction).
+# Both panels are saved individually and as a side-by-side A/B figure.
+# =============================================================================
+ 
+atac_counts <- read.table(
+  file.path(UNIBIND, "PANC1_62901_TFBS_overlap", "TF_counts_in_62901_peaks.txt"),
+  header = FALSE, col.names = c("n_peaks", "TF"), stringsAsFactors = FALSE)
+atac_counts$TF <- trimws(toupper(atac_counts$TF))
+ 
+total_sites <- read.table(
+  file.path(UNIBIND, "TF_total_binding_sites.txt"),
+  header = FALSE, col.names = c("total_sites", "TF"), stringsAsFactors = FALSE)
+total_sites$TF <- trimws(toupper(total_sites$TF))
+ 
+enriched <- atac_counts %>%
+  left_join(total_sites, by = "TF") %>%
+  filter(!is.na(total_sites), total_sites > 0) %>%
+  mutate(enrichment_ratio = n_peaks / total_sites,
+         log2_enrichment  = log2(enrichment_ratio + 1e-6)) %>%
+  arrange(desc(enrichment_ratio))
+ 
+# Before correction
+top_before <- atac_counts %>%
+  arrange(desc(n_peaks)) %>%
+  head(30) %>%
+  mutate(TF = factor(TF, levels = rev(TF)))
+ 
+p_before <- ggplot(top_before, aes(x = n_peaks, y = TF)) +
+  geom_bar(stat = "identity", fill = "#4575B4", alpha = 0.85, width = 0.75) +
+  scale_x_continuous(labels = scales::comma,
+                     expand = expansion(mult = c(0, 0.05))) +
+  theme_word() +
+  theme(axis.text.y = element_text(size = 9)) +
+  labs(title    = "Top 30 TFs in ATAC peaks – before bias correction",
+       subtitle = "PANC1 62,901 consensus peaks (UniBind TFBS)",
+       x        = "Number of binding sites in ATAC peaks",
+       y        = NULL)
+ 
+# After correction
+top_after <- enriched %>%
+  head(30) %>%
+  mutate(TF = factor(TF, levels = rev(TF)))
+ 
+p_after <- ggplot(top_after, aes(x = enrichment_ratio, y = TF)) +
+  geom_bar(stat = "identity", fill = "#D73027", alpha = 0.85, width = 0.75) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_word() +
+  theme(axis.text.y = element_text(size = 9)) +
+  labs(title    = "Top 30 TFs in ATAC peaks – after bias correction",
+       subtitle = "Enrichment ratio = ATAC binding sites / total UniBind sites",
+       x        = "Enrichment ratio",
+       y        = NULL)
+ 
+save_fig(file.path(ENRICH_DIR, "TF_top30_before_correction"),
+         p_before, width = FIG_WIDTH_FULL * 0.7, height = FIG_H_XLTALL)
+save_fig(file.path(ENRICH_DIR, "TF_top30_after_correction"),
+         p_after,  width = FIG_WIDTH_FULL * 0.7, height = FIG_H_XLTALL)
+ 
+combined_bias <- plot_grid(p_before, p_after,
+                           ncol = 2, labels = c("A", "B"), label_size = 12)
+save_fig(file.path(ENRICH_DIR, "TF_bias_correction_combined"),
+         combined_bias, width = FIG_WIDTH_FULL, height = FIG_H_XLTALL)
+ 
+ 
+# =============================================================================
+# 4. TF ACTIVITY HEATMAP (decoupleR ULM)
+# Loads precomputed ULM scores from decoupleR, reshapes to a TF × condition
+# matrix (nascent and steady-state, 2h/4h/6h), and plots a clustered heatmap
+# of the top 50 TFs by maximum absolute activity score.
+# =============================================================================
+ 
+tfact_all <- read_csv(
+  file.path(UNIBIND, "TF_enrichment_decoupleR_62901",
+            "TFactivity_ULM_ALL_contrasts.csv"),
+  show_col_types = FALSE)
+ 
+mat_wide <- tfact_all %>%
+  mutate(col = paste(branch, tp, sep = "_")) %>%
+  group_by(source, col) %>%
+  summarise(score = mean(score, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = col, values_from = score)
+ 
+hm <- as.data.frame(mat_wide)
+rownames(hm) <- hm$source
+hm$source    <- NULL
+ 
+col_order <- c("nascent_2h", "nascent_4h", "nascent_6h",
+               "steady_2h",  "steady_4h",  "steady_6h")
+hm <- hm[, intersect(col_order, colnames(hm)), drop = FALSE]
+ 
+ord     <- order(apply(hm, 1, function(x) max(abs(x), na.rm = TRUE)),
+                 decreasing = TRUE)
+hm_plot <- hm[ord[seq_len(min(50, nrow(hm)))], , drop = FALSE]
+ 
+hm_plot[hm_plot < -10] <- -10
+hm_plot[hm_plot >  10] <-  10
+hm_breaks <- seq(-10, 10, length.out = 101)
+hm_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(100)
+ 
+n_tf <- nrow(hm_plot)
+ 
+save_pheatmap(
+  path_no_ext   = file.path(DECOUPLE, "TFactivity_heatmap"),
+  pheatmap_call = function() {
+    pheatmap::pheatmap(
+      hm_plot,
+      cluster_rows = TRUE,
+      cluster_cols = FALSE,
+      border_color = NA,
+      color        = hm_colors,
+      breaks       = hm_breaks,
+      main         = "TF activity (ULM) – enrichment-corrected TFs\nSLAM-seq THZ531 timecourse",
+      fontsize_row = 9,
+      fontsize_col = 10,
+      fontsize     = 10
+    )
+  },
+  width  = FIG_WIDTH_FULL,
+  n_rows = n_tf
+)
+ 
+ 
+# =============================================================================
+# 5. CHI-SQUARE SUMMARY FIGURE
+# Summarises chi-square tests comparing the proportion of "most downregulated"
+# genes among TF targets (Set A: lineage TFs; Set B: top enriched TFs) vs the
+# genomic background across 2h, 4h, and 6h timepoints.
+# Panel A: grouped barplot of % most-down genes; Panel B: X2 statistic lines.
+# =============================================================================
+ 
+chisq_data <- tibble(
+  tf_set    = c("Set A", "Set B", "Set A", "Set B", "Set A", "Set B"),
+  timepoint = c("2h",    "2h",    "4h",    "4h",    "6h",    "6h"),
+  chi_sq    = c(4.367,   78.070,  5.506,   102.511, 1.036,   142.529),
+  p_value   = c(0.1126,  0.0000,  0.0637,  0.0000,  0.5958,  0.0000),
+  pct_most_goi = c(11/141,  122/1471, 12/141,  133/1471, 7/141,  118/1471) * 100,
+  pct_most_bg  = c(618/12590, 507/11260, 591/12590, 470/11260,
+                   469/12590, 358/11260) * 100
+) %>%
+  mutate(
+    timepoint = factor(timepoint, levels = c("2h", "4h", "6h")),
+    tf_set    = factor(tf_set,    levels = c("Set A", "Set B")),
+    sig_label = case_when(
+      p_value < 0.001 ~ "p < 0.001",
+      p_value < 0.05  ~ "p < 0.05",
+      TRUE            ~ "n.s."
+    ),
+    sig_label = factor(sig_label, levels = c("p < 0.001", "p < 0.05", "n.s."))
+  )
+ 
+SET_COLS <- c("Set A" = "#2166AC", "Set B" = "#D73027")
+ 
+facet_labels <- c(
+  "Set A" = "Set A – Lineage TFs\n(SOX9, SOX17, PDX1, HNF6, HNF1B, FOXA2)",
+  "Set B" = "Set B – Top 30 enriched TFs\n(ATAC + UniBind bias-corrected)"
+)
+ 
+long_pct <- chisq_data %>%
+  select(tf_set, timepoint, sig_label,
+         `TF targets` = pct_most_goi,
+         Background   = pct_most_bg) %>%
+  pivot_longer(cols = c("TF targets", "Background"),
+               names_to = "group", values_to = "pct") %>%
+  mutate(group = factor(group, levels = c("Background", "TF targets")))
+ 
+pA_chisq <- ggplot(long_pct,
+                   aes(x = timepoint, y = pct, fill = tf_set, alpha = group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8),
+           width = 0.7, color = "white", linewidth = 0.3) +
+  geom_text(
+    data     = chisq_data,
+    aes(x    = timepoint,
+        y    = pct_most_goi + 0.4,
+        label = ifelse(p_value < 0.001, "***",
+                ifelse(p_value < 0.05,  "*", "ns")),
+        group = tf_set),
+    position = position_dodge(width = 0.8),
+    size = 3.5, fontface = "bold", inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = SET_COLS, name = "TF set") +
+  scale_alpha_manual(values = c("Background" = 0.35, "TF targets" = 1.0),
+                     name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  facet_wrap(~tf_set, nrow = 1, labeller = labeller(tf_set = facet_labels)) +
+  theme_word() +
+  theme(legend.position = "bottom", panel.grid.major.x = element_blank()) +
+  labs(title = "A  |  % Most down: TF targets vs background",
+       x     = "Timepoint (THZ531 vs DMSO)",
+       y     = "% genes in 'Most down'")
+ 
+pB_chisq <- ggplot(chisq_data,
+                   aes(x = timepoint, y = chi_sq,
+                       color = tf_set, group = tf_set, shape = sig_label)) +
+  geom_line(linewidth = 1.1, alpha = 0.85) +
+  geom_point(aes(size = chi_sq), alpha = 0.9) +
+  geom_text(aes(label = ifelse(p_value < 0.001, "***",
+                        ifelse(p_value < 0.05,  "*", "ns")),
+                vjust = -1.5),
+            size = 3.5, fontface = "bold", show.legend = FALSE) +
+  scale_color_manual(values = SET_COLS, name = "TF set") +
+  scale_shape_manual(
+    values = c("p < 0.001" = 16, "p < 0.05" = 17, "n.s." = 1),
+    name   = "Significance") +
+  scale_size_continuous(range = c(3, 9), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.22))) +
+  theme_word() +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank()) +
+  labs(title = "B  |  Chi-square statistic across timepoints",
+       x     = "Timepoint (THZ531 vs DMSO)",
+       y     = "X2 statistic")
+ 
+combined_chisq <- plot_grid(pA_chisq, pB_chisq, ncol = 2, rel_widths = c(1.4, 1))
+ 
+save_fig(file.path(CHISQ_DIR, "chisq_summary_figure"),
+         combined_chisq, width = FIG_WIDTH_FULL, height = FIG_H_MED + 0.5)
+ 
+ 
+# =============================================================================
+# DONE
+# =============================================================================
+ 
+message("\nAll figures exported successfully.")
+message("Text area width : ", FIG_WIDTH_FULL, " inches")
+message("Resolution      : ", FIG_DPI, " DPI")
