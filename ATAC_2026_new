@@ -1,0 +1,1290 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+###############################################################################
+# BULK ATAC-seq PIPELINE — unified master script
+#
+# Workflow:
+#   1.  FastQC + MultiQC on raw reads
+#   2.  Adapter trimming with Trimmomatic
+#   3.  Bowtie2 alignment
+#   4.  Filter low-quality / improperly paired reads
+#   5.  Library complexity QC (ATACseqQC)
+#   6.  Remove PCR duplicates (Picard)
+#   7.  FastQC + MultiQC on deduplicated BAMs
+#   8.  Remove chrM / chrUn / random / chrEBV
+#   9.  Compute chrM percentage before chromosome filtering
+#   10. Remove ENCODE blacklist regions
+#   11. Fragment-size distribution + TSS enrichment (ATACseqQC)
+#   12. Tn5 shift correction
+#   13. Convert shifted BAM to BED
+#   14. MACS3 cut-site peak calling
+#   15. Peak-count QC
+#   16. bedGraph -> bigWig locally (no Galaxy)
+#   17. IGV instructions
+#   18. Iterative overlap peak merging
+#
+# Read/fragment tracking:
+#   A cumulative table is maintained at:
+#       ${BASE}/read_counts/read_fragment_counts.tsv
+#   Counts are updated at the raw FASTQ, trimmed FASTQ, aligned BAM, filtered
+#   BAM, deduplicated BAM, chromosome-filtered BAM, blacklist-filtered BAM,
+#   and Tn5-shifted BAM stages.
+#
+# Peak-calling strategy:
+#   MACS3 CUT-SITE MODE ONLY.
+#   No BAMPE/fragment-mode alternative is included.
+#
+# Usage:
+#   bash bulk_atacseq_pipeline.sh
+#
+# Optional:
+#   START_STAGE=3 END_STAGE=16 bash bulk_atacseq_pipeline.sh
+#
+###############################################################################
+
+############################
+# USER CONFIGURATION
+############################
+
+PROJECT_BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
+
+# Original raw-data location. This is INPUT ONLY and is never used for new outputs.
+# NOTE: raw fastqs now live under the Autumn 2026 folder, not directly under
+# PROJECT_BASE -- update this if the folder is renamed/moved again.
+RAW_DIR="/data/ATAC/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/ATAC_fastq_files_Autumn2026"
+
+# All newly generated analysis output is written below this folder.
+REANALYSIS_DIR="${PROJECT_BASE}/Reanalysis_ATAC_2026"
+
+START_STAGE="${START_STAGE:-1}"
+END_STAGE="${END_STAGE:-18}"
+
+THREADS="${THREADS:-6}"
+FASTQC_THREADS="${FASTQC_THREADS:-16}"
+
+BT2_THREADS="${BT2_THREADS:-6}"
+SORT_THREADS="${SORT_THREADS:-2}"
+SORT_MEM="${SORT_MEM:-2G}"
+
+# Reference / software paths
+BT2_INDEX="/data/human_genome/GRCh38_index"
+GENOME_FASTA="/data/human_genome/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna"
+CHROM_SIZES="/data/human_genome/hg38.chrom.sizes"
+
+BLACKLIST="/data/hg38-blacklist/hg38-blacklist.v2.bed"
+
+TRIM_JAR="${PROJECT_BASE}/Trimmomatic/Trimmomatic-0.39/Trimmomatic-0.39/trimmomatic-0.39.jar"
+ADAPTERS="${PROJECT_BASE}/Trimmomatic/Trimmomatic-0.39/Trimmomatic-0.39/adapters/NexteraPE-PE.fa"
+
+PICARD_JAR="/data/miniconda/share/picard-2.20.4-0/picard.jar"
+
+MACS3_CONDA_ENV="macs3_src_env"
+CONDA_SH="/data/miniconda/etc/profile.d/conda.sh"
+
+ITERATIVE_SCRIPT="${PROJECT_BASE}/Iterative_overlapping/createIterativeOverlapPeakSet.R"
+
+############################
+# BASE DIRECTORY
+############################
+
+BASE="${REANALYSIS_DIR}"
+
+mkdir -p "${REANALYSIS_DIR}"
+
+############################
+# OUTPUT DIRECTORIES
+############################
+
+RAW_QC_DIR="${BASE}/fastqc_raw"
+TRIM_DIR="${BASE}/trimmed"
+ALIGN_DIR="${BASE}/alignment"
+FILTER_DIR="${BASE}/filtered"
+COMPLEXITY_DIR="${BASE}/ATAC_sample_complexity"
+DEDUP_DIR="${BASE}/dedup"
+DEDUP_QC_DIR="${BASE}/fastqc_dedup"
+CHR_DIR="${BASE}/normChr"
+CHRM_QC_DIR="${BASE}/chrM_percentage_before_filtering"
+BL_DIR="${BASE}/rmblacklist"
+TSS_FRAG_DIR="${BASE}/TSS_enrichment_FragSizeDistribution"
+SHIFT_DIR="${BASE}/shifted"
+BED_DIR="${BASE}/bed"
+MACS_DIR="${BASE}/macs3"
+PEAK_QC_DIR="${BASE}/peak_qc"
+BW_DIR="${BASE}/bigwig"
+LOG_DIR="${BASE}/logs/filtering"
+TMP_SAMTOOLS="${BASE}/tmp_samtools"
+TMP_PICARD="${BASE}/tmp_picard"
+TMP_DEEPTOOLS="${BASE}/tmp_deeptools"
+ITERATIVE_OUTDIR="${BASE}/IterativeOverlapMerged_peaks"
+READ_COUNT_DIR="${BASE}/read_counts"
+READ_COUNT_TSV="${READ_COUNT_DIR}/read_fragment_counts.tsv"
+
+mkdir -p \
+    "${RAW_QC_DIR}" "${TRIM_DIR}" "${ALIGN_DIR}" "${FILTER_DIR}" \
+    "${COMPLEXITY_DIR}" "${DEDUP_DIR}" "${DEDUP_QC_DIR}" "${CHR_DIR}" \
+    "${CHRM_QC_DIR}" "${BL_DIR}" "${TSS_FRAG_DIR}" "${SHIFT_DIR}" \
+    "${BED_DIR}" "${MACS_DIR}" "${PEAK_QC_DIR}" "${BW_DIR}" "${LOG_DIR}" \
+    "${TMP_SAMTOOLS}" "${TMP_PICARD}" "${TMP_DEEPTOOLS}" \
+    "${ITERATIVE_OUTDIR}" "${READ_COUNT_DIR}"
+
+############################
+# HELPERS
+############################
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+run_stage() {
+    local stage="$1"
+    (( stage >= START_STAGE && stage <= END_STAGE ))
+}
+
+require_file() {
+    [[ -s "$1" ]] || die "Required file not found or empty: $1"
+}
+
+require_cmd() {
+    have "$1" || die "Required command not found: $1"
+}
+
+activate_macs3() {
+    require_file "${CONDA_SH}"
+    # shellcheck disable=SC1090
+    source "${CONDA_SH}"
+    conda activate "${MACS3_CONDA_ENV}"
+    require_cmd macs3
+}
+
+
+###############################################################################
+# READ / FRAGMENT COUNTING HELPERS
+###############################################################################
+#
+# The cumulative table is written to:
+#   ${READ_COUNT_TSV}
+#
+# Columns:
+#   Stage
+#   Sample
+#   Total_reads
+#   Total_fragments
+#
+# Definitions:
+#   FASTQ stages:
+#     Total_reads      = R1 reads + R2 reads
+#     Total_fragments  = number of read pairs (R1 count)
+#
+#   BAM stages:
+#     Total_reads      = primary mapped/unmapped alignment records excluding
+#                        secondary and supplementary alignments
+#     Total_fragments  = primary first-in-pair records (one per paired fragment)
+#
+# This gives a consistent paired-end fragment count without simply dividing by
+# two, which can be misleading if orphaned reads are present.
+###############################################################################
+
+init_read_count_table() {
+    mkdir -p "${READ_COUNT_DIR}"
+
+    if [[ ! -f "${READ_COUNT_TSV}" ]]; then
+        printf "Stage\tSample\tTotal_reads\tTotal_fragments\n" > "${READ_COUNT_TSV}"
+    fi
+}
+
+record_count_row() {
+    local stage="$1"
+    local sample="$2"
+    local reads="$3"
+    local fragments="$4"
+
+    init_read_count_table
+
+    # Replace an existing row for the same Stage+Sample so re-runs do not
+    # duplicate metrics.
+    awk -F '\t' -v st="${stage}" -v sm="${sample}" '
+        NR == 1 {print; next}
+        !($1 == st && $2 == sm) {print}
+    ' "${READ_COUNT_TSV}" > "${READ_COUNT_TSV}.tmp"
+
+    printf "%s\t%s\t%s\t%s\n" \
+        "${stage}" "${sample}" "${reads}" "${fragments}" \
+        >> "${READ_COUNT_TSV}.tmp"
+
+    mv "${READ_COUNT_TSV}.tmp" "${READ_COUNT_TSV}"
+
+    log "COUNT ${stage} | ${sample} | reads=${reads} | fragments=${fragments}"
+}
+
+count_fastq_pair() {
+    local stage="$1"
+    local sample="$2"
+    local r1="$3"
+    local r2="$4"
+
+    require_cmd gzip
+
+    local r1_lines r2_lines r1_reads r2_reads total_reads fragments
+
+    r1_lines=$(gzip -cd "${r1}" | wc -l)
+    r2_lines=$(gzip -cd "${r2}" | wc -l)
+
+    (( r1_lines % 4 == 0 )) || die "FASTQ line count is not divisible by 4: ${r1}"
+    (( r2_lines % 4 == 0 )) || die "FASTQ line count is not divisible by 4: ${r2}"
+
+    r1_reads=$(( r1_lines / 4 ))
+    r2_reads=$(( r2_lines / 4 ))
+
+    total_reads=$(( r1_reads + r2_reads ))
+
+    if (( r1_reads != r2_reads )); then
+        echo "WARNING: R1/R2 read counts differ for ${sample}: R1=${r1_reads}, R2=${r2_reads}" >&2
+        fragments=$(( r1_reads < r2_reads ? r1_reads : r2_reads ))
+    else
+        fragments="${r1_reads}"
+    fi
+
+    record_count_row "${stage}" "${sample}" "${total_reads}" "${fragments}"
+}
+
+count_bam() {
+    local stage="$1"
+    local sample="$2"
+    local bam="$3"
+
+    require_cmd samtools
+    [[ -s "${bam}" ]] || die "Cannot count missing/empty BAM: ${bam}"
+
+    local total_reads total_fragments
+
+    # Exclude secondary (0x100) and supplementary (0x800) alignments.
+    # 0x900 = 0x100 + 0x800.
+    total_reads=$(samtools view -@ "${THREADS}" -c -F 2304 "${bam}")
+
+    # First-in-pair (0x40), excluding secondary/supplementary.
+    # This counts one record per paired fragment.
+    total_fragments=$(samtools view -@ "${THREADS}" -c -f 64 -F 2304 "${bam}")
+
+    record_count_row "${stage}" "${sample}" "${total_reads}" "${total_fragments}"
+}
+
+show_read_count_summary() {
+    [[ -s "${READ_COUNT_TSV}" ]] || return 0
+
+    echo
+    log "Current read / fragment count summary"
+
+    if have column; then
+        column -t -s $'\t' "${READ_COUNT_TSV}"
+    else
+        cat "${READ_COUNT_TSV}"
+    fi
+    echo
+}
+
+###############################################################################
+# STAGE 1 — FASTQC RAW READS
+###############################################################################
+
+stage_1() {
+    log "STAGE 1: FastQC on raw reads"
+
+    require_cmd fastqc
+    require_cmd multiqc
+
+    shopt -s nullglob
+
+    local fastqs=("${RAW_DIR}"/Sample_*/*_R1_001.fastq.gz "${RAW_DIR}"/Sample_*/*_R2_001.fastq.gz)
+    (( ${#fastqs[@]} > 0 )) || die "No FASTQ files found for Stage 1"
+
+    fastqc -t "${FASTQC_THREADS}" "${fastqs[@]}" -o "${RAW_QC_DIR}"
+    multiqc -f -o "${RAW_QC_DIR}" "${RAW_QC_DIR}"
+
+    local raw_r1s=("${RAW_DIR}"/Sample_*/*_R1_001.fastq.gz)
+    for R1 in "${raw_r1s[@]}"; do
+        local R2="${R1/_R1_001.fastq.gz/_R2_001.fastq.gz}"
+        [[ -s "${R2}" ]] || continue
+
+        local sample
+        sample=$(basename "${R1%_R1_001.fastq.gz}")
+
+        count_fastq_pair "01_raw_FASTQ" "${sample}" "${R1}" "${R2}"
+    done
+
+    show_read_count_summary
+    log "STAGE 1 complete"
+}
+
+###############################################################################
+# STAGE 2 — TRIMMOMATIC
+###############################################################################
+
+stage_2() {
+    log "STAGE 2: Adapter trimming"
+
+    require_cmd java
+    require_file "${TRIM_JAR}"
+    require_file "${ADAPTERS}"
+
+    shopt -s nullglob
+
+    local r1s=("${RAW_DIR}"/Sample_*/*_R1_001.fastq.gz)
+    (( ${#r1s[@]} > 0 )) || die "No R1 FASTQ files found for Stage 2"
+
+    for R1 in "${r1s[@]}"; do
+        local R2="${R1/_R1_001.fastq.gz/_R2_001.fastq.gz}"
+        [[ -f "${R2}" ]] || {
+            echo "WARNING: Missing R2 for ${R1}; skipping" >&2
+            continue
+        }
+
+        local sample
+        sample=$(basename "${R1%_R1_001.fastq.gz}")
+
+        local out_prefix="${TRIM_DIR}/${sample}"
+        local out_r1="${out_prefix}_R1_paired.fastq.gz"
+        local out_r2="${out_prefix}_R2_paired.fastq.gz"
+
+        if [[ -s "${out_r1}" && -s "${out_r2}" ]]; then
+            log "SKIP trimming: ${sample}"
+            continue
+        fi
+
+        log "Trimming ${sample}"
+
+        java -jar "${TRIM_JAR}" PE \
+            -threads "${FASTQC_THREADS}" \
+            -phred33 \
+            -trimlog "${out_prefix}.trimlog" \
+            "${R1}" "${R2}" \
+            "${out_r1}" \
+            "${out_prefix}_R1_unpaired.fastq.gz" \
+            "${out_r2}" \
+            "${out_prefix}_R2_unpaired.fastq.gz" \
+            ILLUMINACLIP:"${ADAPTERS}":2:30:10:2:True \
+            LEADING:3 \
+            TRAILING:3 \
+            MINLEN:36
+
+        count_fastq_pair "02_trimmed_paired_FASTQ" "${sample}" "${out_r1}" "${out_r2}"
+    done
+
+    # Count outputs that were skipped because they already existed.
+    for R1P in "${TRIM_DIR}"/*_R1_paired.fastq.gz; do
+        [[ -e "${R1P}" ]] || continue
+        local R2P="${R1P/_R1_paired.fastq.gz/_R2_paired.fastq.gz}"
+        [[ -s "${R2P}" ]] || continue
+        local sample_existing
+        sample_existing=$(basename "${R1P%_R1_paired.fastq.gz}")
+        count_fastq_pair "02_trimmed_paired_FASTQ" "${sample_existing}" "${R1P}" "${R2P}"
+    done
+
+    show_read_count_summary
+    log "STAGE 2 complete"
+}
+
+###############################################################################
+# STAGE 3 — BOWTIE2 INDEX + ALIGNMENT
+###############################################################################
+
+stage_3() {
+    log "STAGE 3: Bowtie2 alignment"
+
+    require_cmd bowtie2
+    require_cmd bowtie2-build
+    require_cmd samtools
+
+    # Build index only if missing.
+    if [[ ! -f "${BT2_INDEX}.1.bt2" && ! -f "${BT2_INDEX}.1.bt2l" ]]; then
+        require_file "${GENOME_FASTA}"
+        log "Bowtie2 index not found; building ${BT2_INDEX}"
+        bowtie2-build "${GENOME_FASTA}" "${BT2_INDEX}"
+    fi
+
+    shopt -s nullglob
+    local r1ps=("${TRIM_DIR}"/*_R1_paired.fastq.gz)
+    (( ${#r1ps[@]} > 0 )) || die "No trimmed paired R1 files found for Stage 3"
+
+    for R1P in "${r1ps[@]}"; do
+        local R2P="${R1P/_R1_paired.fastq.gz/_R2_paired.fastq.gz}"
+        [[ -f "${R2P}" ]] || die "Missing R2 for ${R1P}"
+
+        local sample
+        sample=$(basename "${R1P%_R1_paired.fastq.gz}")
+
+        local BAM="${ALIGN_DIR}/${sample}_sorted.bam"
+        local BAI="${BAM}.bai"
+        local TMP_PREFIX="${TMP_SAMTOOLS}/${sample}"
+
+        if [[ -s "${BAM}" && -s "${BAI}" ]]; then
+            log "SKIP alignment: ${sample}"
+            continue
+        fi
+
+        log "Aligning ${sample}"
+
+        bowtie2 \
+            --threads "${BT2_THREADS}" \
+            --very-sensitive \
+            --no-discordant \
+            -X 2000 \
+            -x "${BT2_INDEX}" \
+            -1 "${R1P}" \
+            -2 "${R2P}" \
+        | samtools view -@ "${SORT_THREADS}" -b - \
+        | samtools sort \
+            -@ "${SORT_THREADS}" \
+            -m "${SORT_MEM}" \
+            -T "${TMP_PREFIX}" \
+            -o "${BAM}" -
+
+        samtools index -@ "${SORT_THREADS}" "${BAM}"
+    done
+
+    shopt -s nullglob
+    local count_bams=("${ALIGN_DIR}"/*_sorted.bam)
+    for BAM_COUNT in "${count_bams[@]}"; do
+        local sample_count
+        sample_count=$(basename "${BAM_COUNT%_sorted.bam}")
+        count_bam "03_aligned_BAM" "${sample_count}" "${BAM_COUNT}"
+    done
+
+    show_read_count_summary
+    log "STAGE 3 complete"
+}
+
+###############################################################################
+# STAGE 4 — FILTER READS + FLAGSTAT
+###############################################################################
+
+stage_4() {
+    log "STAGE 4: Filtering low-quality / improperly paired reads"
+
+    require_cmd samtools
+
+    shopt -s nullglob
+    local bams=("${ALIGN_DIR}"/*_sorted.bam)
+    (( ${#bams[@]} > 0 )) || die "No aligned BAMs found for Stage 4"
+
+    for BAM in "${bams[@]}"; do
+        local sample
+        sample=$(basename "${BAM%_sorted.bam}")
+
+        local OUT="${FILTER_DIR}/${sample}_filtered.bam"
+
+        if [[ ! -s "${OUT}" || ! -s "${OUT}.bai" ]]; then
+            log "Filtering ${sample}"
+
+            samtools view -@ "${THREADS}" -bh -f 3 -q 30 "${BAM}" \
+            | samtools sort -@ "${THREADS}" -o "${OUT}" -
+
+            samtools index -@ "${THREADS}" "${OUT}"
+        else
+            log "SKIP filtering: ${sample}"
+        fi
+
+        samtools flagstat "${OUT}" > "${LOG_DIR}/${sample}_after.flagstat.txt"
+    done
+
+    shopt -s nullglob
+    local count_bams=("${FILTER_DIR}"/*_filtered.bam)
+    for BAM_COUNT in "${count_bams[@]}"; do
+        local sample_count
+        sample_count=$(basename "${BAM_COUNT%_filtered.bam}")
+        count_bam "04_filtered_BAM" "${sample_count}" "${BAM_COUNT}"
+    done
+
+    show_read_count_summary
+    log "STAGE 4 complete"
+}
+
+###############################################################################
+# STAGE 5 — LIBRARY COMPLEXITY QC
+###############################################################################
+
+stage_5() {
+    log "STAGE 5: Library complexity QC"
+
+    require_cmd Rscript
+
+    BASE_R="${BASE}" OUT_R="${COMPLEXITY_DIR}" Rscript --vanilla - <<'RSCRIPT'
+suppressPackageStartupMessages({
+    library(ATACseqQC)
+})
+
+base_dir <- Sys.getenv("BASE_R")
+out_dir  <- Sys.getenv("OUT_R")
+bam_dir  <- file.path(base_dir, "filtered")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+bams <- list.files(
+    bam_dir,
+    pattern = "_filtered\\.bam$",
+    full.names = TRUE
+)
+
+if (length(bams) == 0) {
+    stop("No filtered BAM files found")
+}
+
+for (bam in bams) {
+    sample <- sub("_filtered\\.bam$", "", basename(bam))
+    outfile <- file.path(
+        out_dir,
+        paste0(sample, "_library_complexity.pdf")
+    )
+
+    pdf(outfile, width = 11, height = 8.5)
+
+    tryCatch({
+        dupfreq <- readsDupFreq(bam)
+        estimateLibComplexity(dupfreq)
+    }, error = function(e) {
+        plot.new()
+        text(0.5, 0.5, paste("ERROR:", e$message))
+    })
+
+    dev.off()
+}
+RSCRIPT
+
+    log "STAGE 5 complete"
+}
+
+###############################################################################
+# STAGE 6 — REMOVE PCR DUPLICATES
+###############################################################################
+
+stage_6() {
+    log "STAGE 6: PCR duplicate removal"
+
+    require_cmd java
+    require_cmd samtools
+    require_file "${PICARD_JAR}"
+
+    shopt -s nullglob
+    local bams=("${FILTER_DIR}"/*_filtered.bam)
+    (( ${#bams[@]} > 0 )) || die "No filtered BAMs found for Stage 6"
+
+    for BAM in "${bams[@]}"; do
+        local sample
+        sample=$(basename "${BAM%_filtered.bam}")
+
+        local UNSORTED="${DEDUP_DIR}/${sample}_dd_unsorted.bam"
+        local SORTED="${DEDUP_DIR}/${sample}_dd_sorted.bam"
+        local METRICS="${DEDUP_DIR}/${sample}_dup_metrics.txt"
+
+        if [[ -s "${SORTED}" && -s "${SORTED}.bai" && -s "${METRICS}" ]]; then
+            log "SKIP duplicate removal: ${sample}"
+            continue
+        fi
+
+        log "MarkDuplicates ${sample}"
+
+        rm -f "${UNSORTED}" "${SORTED}" "${SORTED}.bai"
+
+        java \
+            -Djava.io.tmpdir="${TMP_PICARD}" \
+            -Xmx8g \
+            -jar "${PICARD_JAR}" \
+            MarkDuplicates \
+            INPUT="${BAM}" \
+            OUTPUT="${UNSORTED}" \
+            METRICS_FILE="${METRICS}" \
+            REMOVE_DUPLICATES=true \
+            TMP_DIR="${TMP_PICARD}" \
+            VALIDATION_STRINGENCY=SILENT
+
+        samtools sort \
+            --threads "${THREADS}" \
+            -o "${SORTED}" \
+            "${UNSORTED}"
+
+        samtools index -@ "${THREADS}" "${SORTED}"
+        rm -f "${UNSORTED}"
+    done
+
+    shopt -s nullglob
+    local count_bams=("${DEDUP_DIR}"/*_dd_sorted.bam)
+    for BAM_COUNT in "${count_bams[@]}"; do
+        local sample_count
+        sample_count=$(basename "${BAM_COUNT%_dd_sorted.bam}")
+        count_bam "06_deduplicated_BAM" "${sample_count}" "${BAM_COUNT}"
+    done
+
+    show_read_count_summary
+    log "STAGE 6 complete"
+}
+
+###############################################################################
+# STAGE 7 — FASTQC ON DEDUPLICATED BAMs
+###############################################################################
+
+stage_7() {
+    log "STAGE 7: FastQC on deduplicated BAMs"
+
+    require_cmd fastqc
+    require_cmd multiqc
+
+    shopt -s nullglob
+    local bams=("${DEDUP_DIR}"/*_dd_sorted.bam)
+    (( ${#bams[@]} > 0 )) || die "No deduplicated BAMs found for Stage 7"
+
+    fastqc \
+        -t "${THREADS}" \
+        -o "${DEDUP_QC_DIR}" \
+        "${bams[@]}"
+
+    multiqc \
+        -f \
+        -o "${DEDUP_QC_DIR}" \
+        "${DEDUP_QC_DIR}"
+
+    log "STAGE 7 complete"
+}
+
+###############################################################################
+# STAGE 8 — REMOVE chrM / chrUn / random / chrEBV
+###############################################################################
+
+stage_8() {
+    log "STAGE 8: Removing chrM / chrUn / random / chrEBV"
+
+    require_cmd samtools
+
+    shopt -s nullglob
+    local bams=("${DEDUP_DIR}"/*_dd_sorted.bam)
+    (( ${#bams[@]} > 0 )) || die "No deduplicated BAMs found for Stage 8"
+
+    # Explicit allowlist of standard chromosomes, passed to samtools view as
+    # region arguments. This is preferred over grep/awk-filtering read lines:
+    # those approaches drop the unwanted alignment records but leave the
+    # chrM/chrUn_*/random/chrEBV entries sitting in the BAM header's @SQ
+    # lines. Giving samtools view an explicit region list makes it build a
+    # genuinely clean subset header containing only the requested contigs,
+    # using the BAM index rather than scanning every read.
+    local KEEP_CHRS=()
+    local i
+    for i in $(seq 1 22); do KEEP_CHRS+=("chr${i}"); done
+    KEEP_CHRS+=("chrX" "chrY")
+
+    for BAM in "${bams[@]}"; do
+        local sample
+        sample=$(basename "${BAM%_dd_sorted.bam}")
+
+        local OUT="${CHR_DIR}/${sample}_normChr.bam"
+
+        if [[ ! -s "${OUT}" || ! -s "${OUT}.bai" ]]; then
+            log "Chromosome filtering ${sample}"
+
+            require_file "${BAM}.bai"
+
+            samtools view -@ "${THREADS}" -b "${BAM}" "${KEEP_CHRS[@]}" \
+            | samtools sort -@ "${THREADS}" -o "${OUT}" -
+
+            samtools index -@ "${THREADS}" "${OUT}"
+        else
+            log "SKIP chromosome filtering: ${sample}"
+        fi
+
+        samtools idxstats "${OUT}" > "${CHR_DIR}/${sample}_normChr.idxstats"
+        samtools flagstat "${OUT}" > "${CHR_DIR}/${sample}_normChr.flagstat"
+    done
+
+    shopt -s nullglob
+    local count_bams=("${CHR_DIR}"/*_normChr.bam)
+    for BAM_COUNT in "${count_bams[@]}"; do
+        local sample_count
+        sample_count=$(basename "${BAM_COUNT%_normChr.bam}")
+        count_bam "08_normChr_BAM" "${sample_count}" "${BAM_COUNT}"
+    done
+
+    show_read_count_summary
+    log "STAGE 8 complete"
+}
+
+###############################################################################
+# STAGE 9 — chrM PERCENTAGE BEFORE CHROMOSOME FILTERING
+###############################################################################
+
+stage_9() {
+    log "STAGE 9: chrM percentage"
+
+    require_cmd samtools
+
+    local OUT="${CHRM_QC_DIR}/chrM_percentage_before_filtering.tsv"
+
+    shopt -s nullglob
+    local bams=("${DEDUP_DIR}"/*_dd_sorted.bam)
+    (( ${#bams[@]} > 0 )) || die "No deduplicated BAMs found for Stage 9"
+
+    {
+        printf "Sample\tchrM_percent\n"
+
+        for BAM in "${bams[@]}"; do
+            local sample
+            sample=$(basename "${BAM%_dd_sorted.bam}")
+
+            local chrM total
+
+            chrM=$(
+                samtools idxstats "${BAM}" \
+                | awk '$1=="chrM"{print $3}'
+            )
+            chrM="${chrM:-0}"
+
+            total=$(
+                samtools idxstats "${BAM}" \
+                | awk '{sum += $3} END {print sum+0}'
+            )
+
+            awk \
+                -v s="${sample}" \
+                -v m="${chrM}" \
+                -v t="${total}" \
+                'BEGIN {
+                    printf "%s\t%.2f\n", s, (t > 0 ? m/t*100 : 0)
+                }'
+        done
+    } > "${OUT}"
+
+    log "Saved ${OUT}"
+    log "STAGE 9 complete"
+}
+
+###############################################################################
+# STAGE 10 — REMOVE ENCODE BLACKLIST
+###############################################################################
+
+stage_10() {
+    log "STAGE 10: ENCODE blacklist removal"
+
+    require_cmd samtools
+    require_cmd bedtools
+    require_file "${BLACKLIST}"
+
+    shopt -s nullglob
+    local bams=("${CHR_DIR}"/*_normChr.bam)
+    (( ${#bams[@]} > 0 )) || die "No chromosome-filtered BAMs found for Stage 10"
+
+    for BAM in "${bams[@]}"; do
+        local sample
+        sample=$(basename "${BAM%_normChr.bam}")
+
+        local OUT="${BL_DIR}/${sample}_rmblacklisted.bam"
+
+        samtools flagstat "${BAM}" \
+            > "${BL_DIR}/${sample}_before_blacklist.flagstat"
+
+        local removed
+        removed=$(
+            bedtools intersect \
+                -abam "${BAM}" \
+                -b "${BLACKLIST}" \
+                -u \
+            | samtools view -c -
+        )
+
+        echo "${removed}" \
+            > "${BL_DIR}/${sample}_blacklist_overlaps.count"
+
+        if [[ ! -s "${OUT}" || ! -s "${OUT}.bai" ]]; then
+            log "Blacklist filtering ${sample}"
+
+            bedtools intersect \
+                -abam "${BAM}" \
+                -b "${BLACKLIST}" \
+                -v \
+            | samtools sort \
+                -@ "${THREADS}" \
+                -o "${OUT}" -
+
+            samtools index -@ "${THREADS}" "${OUT}"
+        else
+            log "SKIP blacklist filtering: ${sample}"
+        fi
+
+        samtools flagstat "${OUT}" \
+            > "${BL_DIR}/${sample}_rmblacklisted.flagstat"
+
+        log "${sample}: blacklist-overlapping reads removed = ${removed}"
+    done
+
+    shopt -s nullglob
+    local count_bams=("${BL_DIR}"/*_rmblacklisted.bam)
+    for BAM_COUNT in "${count_bams[@]}"; do
+        local sample_count
+        sample_count=$(basename "${BAM_COUNT%_rmblacklisted.bam}")
+        count_bam "10_rmblacklist_BAM" "${sample_count}" "${BAM_COUNT}"
+    done
+
+    show_read_count_summary
+    log "STAGE 10 complete"
+}
+
+###############################################################################
+# STAGE 11 — FRAGMENT SIZE + TSS ENRICHMENT
+###############################################################################
+
+stage_11() {
+    log "STAGE 11: Fragment size distribution + TSS enrichment"
+
+    require_cmd Rscript
+
+    BASE_R="${BASE}" OUT_R="${TSS_FRAG_DIR}" Rscript --vanilla - <<'RSCRIPT'
+suppressPackageStartupMessages({
+    library(ATACseqQC)
+    library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+    library(GenomicAlignments)
+})
+
+base_dir <- Sys.getenv("BASE_R")
+out_dir  <- Sys.getenv("OUT_R")
+bam_dir  <- file.path(base_dir, "rmblacklist")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+bams <- list.files(
+    bam_dir,
+    pattern = "_rmblacklisted\\.bam$",
+    full.names = TRUE
+)
+
+if (length(bams) == 0) {
+    stop("No blacklist-filtered BAM files found")
+}
+
+txs <- transcripts(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+frag_pdf <- file.path(
+    out_dir,
+    "ATAC_fragment_size_distribution_all_samples.pdf"
+)
+
+pdf(frag_pdf, width = 11, height = 8.5)
+
+for (bam in bams) {
+    sample <- sub("_rmblacklisted\\.bam$", "", basename(bam))
+    tryCatch({
+        fragSizeDist(bam, sample)
+    }, error = function(e) {
+        plot.new()
+        text(0.5, 0.5, paste(sample, "\nERROR:", e$message))
+    })
+}
+
+dev.off()
+
+tss_pdf <- file.path(
+    out_dir,
+    "ATAC_TSS_enrichment_all_samples.pdf"
+)
+
+pdf(tss_pdf, width = 11, height = 8.5)
+
+for (bam in bams) {
+    sample <- sub("_rmblacklisted\\.bam$", "", basename(bam))
+
+    tryCatch({
+        ga <- readGAlignments(bam)
+
+        keep_chr <- c(
+            paste0("chr", 1:22),
+            "chrX",
+            "chrY"
+        )
+
+        ga <- ga[as.character(seqnames(ga)) %in% keep_chr]
+
+        tsse <- TSSEscore(ga, txs)
+
+        plot(
+            100 * (-9:10 - 0.5),
+            tsse$values,
+            type = "b",
+            main = sample,
+            xlab = "Distance to TSS (bp)",
+            ylab = "Aggregate TSS score"
+        )
+    }, error = function(e) {
+        plot.new()
+        text(0.5, 0.5, paste(sample, "\nERROR:", e$message))
+    })
+}
+
+dev.off()
+RSCRIPT
+
+    log "STAGE 11 complete"
+}
+
+###############################################################################
+# STAGE 12 — Tn5 SHIFT
+###############################################################################
+
+stage_12() {
+    log "STAGE 12: Tn5 shift correction"
+
+    require_cmd alignmentSieve
+    require_cmd samtools
+
+    export TMPDIR="${TMP_DEEPTOOLS}"
+
+    shopt -s nullglob
+    local bams=("${BL_DIR}"/*_rmblacklisted.bam)
+    (( ${#bams[@]} > 0 )) || die "No blacklist-filtered BAMs found for Stage 12"
+
+    for BAM in "${bams[@]}"; do
+        local sample
+        sample=$(basename "${BAM%_rmblacklisted.bam}")
+
+        local UNSORTED="${SHIFT_DIR}/${sample}_shifted_unsorted.bam"
+        local SORTED="${SHIFT_DIR}/${sample}_shifted_sorted.bam"
+        local METRICS="${SHIFT_DIR}/${sample}_shifted_metrics.txt"
+
+        if [[ -s "${SORTED}" && -s "${SORTED}.bai" ]]; then
+            log "SKIP Tn5 shifting: ${sample}"
+            continue
+        fi
+
+        log "Tn5 shifting ${sample}"
+
+        rm -f "${UNSORTED}"
+
+        alignmentSieve \
+            --ATACshift \
+            -b "${BAM}" \
+            -o "${UNSORTED}" \
+            --filterMetrics "${METRICS}"
+
+        samtools sort \
+            --threads "${THREADS}" \
+            -o "${SORTED}" \
+            "${UNSORTED}"
+
+        samtools index -@ "${THREADS}" "${SORTED}"
+        rm -f "${UNSORTED}"
+    done
+
+    shopt -s nullglob
+    local count_bams=("${SHIFT_DIR}"/*_shifted_sorted.bam)
+    for BAM_COUNT in "${count_bams[@]}"; do
+        local sample_count
+        sample_count=$(basename "${BAM_COUNT%_shifted_sorted.bam}")
+        count_bam "12_Tn5_shifted_BAM" "${sample_count}" "${BAM_COUNT}"
+    done
+
+    show_read_count_summary
+    log "STAGE 12 complete"
+}
+
+###############################################################################
+# STAGE 13 — SHIFTED BAM -> BED
+###############################################################################
+
+stage_13() {
+    log "STAGE 13: Shifted BAM -> BED"
+
+    require_cmd bedtools
+
+    shopt -s nullglob
+    local bams=("${SHIFT_DIR}"/*_shifted_sorted.bam)
+    (( ${#bams[@]} > 0 )) || die "No shifted BAMs found for Stage 13"
+
+    for BAM in "${bams[@]}"; do
+        local sample
+        sample=$(basename "${BAM%_shifted_sorted.bam}")
+
+        local OUT="${BED_DIR}/${sample}.bed"
+
+        if [[ -s "${OUT}" ]]; then
+            log "SKIP BAM -> BED: ${sample}"
+            continue
+        fi
+
+        log "Converting ${sample} to BED"
+
+        bedtools bamtobed -i "${BAM}" > "${OUT}"
+
+        local n
+        n=$(wc -l < "${OUT}")
+        (( n > 0 )) || die "Empty BED produced for ${sample}"
+
+        log "${sample}: ${n} BED alignments"
+    done
+
+    log "STAGE 13 complete"
+}
+
+###############################################################################
+# STAGE 14 — MACS3 CUT-SITE PEAK CALLING
+###############################################################################
+
+stage_14() {
+    log "STAGE 14: MACS3 cut-site peak calling"
+
+    activate_macs3
+
+    shopt -s nullglob
+    local beds=("${BED_DIR}"/*.bed)
+    (( ${#beds[@]} > 0 )) || die "No BED files found for Stage 14"
+
+    for BED in "${beds[@]}"; do
+        local sample
+        sample=$(basename "${BED%.bed}")
+
+        local NAME="${sample}.macs3"
+        local PEAK_FILE="${MACS_DIR}/${NAME}_peaks.narrowPeak"
+
+        if [[ -s "${PEAK_FILE}" ]]; then
+            log "SKIP MACS3: ${sample}"
+            continue
+        fi
+
+        log "Calling peaks for ${sample}"
+
+        macs3 callpeak \
+            -t "${BED}" \
+            -f BED \
+            -g hs \
+            -n "${NAME}" \
+            --outdir "${MACS_DIR}" \
+            --nomodel \
+            --shift -100 \
+            --extsize 200 \
+            --keep-dup all \
+            --call-summits \
+            -q 0.01 \
+            -B \
+            --SPMR
+    done
+
+    log "STAGE 14 complete"
+}
+
+###############################################################################
+# STAGE 15 — PEAK COUNTS
+###############################################################################
+
+stage_15() {
+    log "STAGE 15: Peak-count QC"
+
+    local OUT="${PEAK_QC_DIR}/macs3_peak_counts.tsv"
+
+    shopt -s nullglob
+    local peaks=("${MACS_DIR}"/*.macs3_peaks.narrowPeak)
+    (( ${#peaks[@]} > 0 )) || die "No MACS3 narrowPeak files found for Stage 15"
+
+    {
+        printf "Sample\tPeak_count\n"
+
+        for PEAK in "${peaks[@]}"; do
+            local sample
+            sample=$(basename "${PEAK%.macs3_peaks.narrowPeak}")
+
+            local count
+            count=$(wc -l < "${PEAK}")
+
+            printf "%s\t%s\n" "${sample}" "${count}"
+        done
+    } > "${OUT}"
+
+    if have column; then
+        column -t -s $'\t' "${OUT}"
+    else
+        cat "${OUT}"
+    fi
+
+    log "Saved ${OUT}"
+    log "STAGE 15 complete"
+}
+
+###############################################################################
+# STAGE 16 — bedGraph -> bigWig LOCALLY
+###############################################################################
+
+stage_16() {
+    log "STAGE 16: bedGraph -> bigWig"
+
+    require_cmd bedGraphToBigWig
+    require_file "${CHROM_SIZES}"
+
+    shopt -s nullglob
+    local bdgs=("${MACS_DIR}"/*.macs3_treat_pileup.bdg)
+    (( ${#bdgs[@]} > 0 )) || die "No MACS3 treatment pileup bedGraphs found"
+
+    for BDG in "${bdgs[@]}"; do
+        local sample
+        sample=$(basename "${BDG%.macs3_treat_pileup.bdg}")
+
+        local SORTED="${BW_DIR}/${sample}.sorted.bedGraph"
+        local BW="${BW_DIR}/${sample}.bw"
+
+        if [[ -s "${BW}" ]]; then
+            log "SKIP bigWig: ${sample}"
+            continue
+        fi
+
+        log "Creating bigWig for ${sample}"
+
+        LC_ALL=C sort \
+            -k1,1 \
+            -k2,2n \
+            "${BDG}" \
+            > "${SORTED}"
+
+        bedGraphToBigWig \
+            "${SORTED}" \
+            "${CHROM_SIZES}" \
+            "${BW}"
+
+        rm -f "${SORTED}"
+    done
+
+    log "STAGE 16 complete"
+}
+
+###############################################################################
+# STAGE 17 — IGV INSTRUCTIONS
+###############################################################################
+
+stage_17() {
+    log "STAGE 17: IGV visualization"
+
+    cat <<EOF
+
+IGV visualization
+-----------------
+Genome:
+    hg38
+
+Load:
+    ${BW_DIR}/*.bw
+
+Suggested condition groups:
+    DMSO
+    THZ531-2H
+    THZ531-4H
+    THZ531-6H
+
+For fair visual comparison, use the same y-axis/data range across tracks
+being compared.
+
+EOF
+
+    log "STAGE 17 complete"
+}
+
+###############################################################################
+# STAGE 18 — ITERATIVE OVERLAP PEAK MERGING
+###############################################################################
+
+stage_18() {
+    log "STAGE 18: Iterative overlap peak merging"
+
+    require_cmd Rscript
+    require_file "${BLACKLIST}"
+    require_file "${ITERATIVE_SCRIPT}"
+
+    local META="${MACS_DIR}/metadata_atac.txt"
+
+    shopt -s nullglob
+    local summits=("${MACS_DIR}"/*.macs3_summits.bed)
+    (( ${#summits[@]} > 0 )) || die "No MACS3 summit files found for Stage 18"
+
+    printf "Sample\tGroup\n" > "${META}"
+
+    for f in "${summits[@]}"; do
+        local filename sample group
+
+        filename=$(basename "${f}")
+        sample="${filename%_summits.bed}"
+
+        case "${sample}" in
+            *DMSO*)
+                group="DMSO"
+                ;;
+            *THZ531-2H*)
+                group="THZ2h"
+                ;;
+            *THZ531-4H*)
+                group="THZ4h"
+                ;;
+            *THZ531-6H*)
+                group="THZ6h"
+                ;;
+            *)
+                die "Cannot assign experimental group for ${sample}"
+                ;;
+        esac
+
+        printf "%s\t%s\n" "${sample}" "${group}" >> "${META}"
+    done
+
+    log "Metadata written to ${META}"
+
+    if have column; then
+        column -t -s $'\t' "${META}"
+    else
+        cat "${META}"
+    fi
+
+    Rscript "${ITERATIVE_SCRIPT}" \
+        --metadata "${META}" \
+        --macs2dir "${MACS_DIR}/" \
+        --outdir "${ITERATIVE_OUTDIR}" \
+        --suffix "_summits.bed" \
+        --blacklist "${BLACKLIST}" \
+        --genome hg38 \
+        --spm 5 \
+        --rule "(n+1)/2" \
+        --extend 250
+
+    log "STAGE 18 complete"
+}
+
+###############################################################################
+# MAIN
+###############################################################################
+
+main() {
+    log "Bulk ATAC-seq pipeline"
+    log "RAW_DIR=${RAW_DIR}"
+    log "REANALYSIS_DIR=${REANALYSIS_DIR}"
+    log "BASE=${BASE}"
+    log "Stages ${START_STAGE} through ${END_STAGE}"
+
+    if run_stage 1; then stage_1; fi
+    if run_stage 2; then stage_2; fi
+    if run_stage 3; then stage_3; fi
+    if run_stage 4; then stage_4; fi
+    if run_stage 5; then stage_5; fi
+    if run_stage 6; then stage_6; fi
+    if run_stage 7; then stage_7; fi
+    if run_stage 8; then stage_8; fi
+    if run_stage 9; then stage_9; fi
+    if run_stage 10; then stage_10; fi
+    if run_stage 11; then stage_11; fi
+    if run_stage 12; then stage_12; fi
+    if run_stage 13; then stage_13; fi
+    if run_stage 14; then stage_14; fi
+    if run_stage 15; then stage_15; fi
+    if run_stage 16; then stage_16; fi
+    if run_stage 17; then stage_17; fi
+    if run_stage 18; then stage_18; fi
+
+    log "Pipeline finished successfully"
+}
+
+main "$@"
