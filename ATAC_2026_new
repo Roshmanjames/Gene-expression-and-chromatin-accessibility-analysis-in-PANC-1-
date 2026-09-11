@@ -5,6 +5,7 @@ set -euo pipefail
 # BULK ATAC-seq PIPELINE — unified master script
 #
 # Workflow:
+#   0.  Build test dataset
 #   1.  FastQC + MultiQC on raw reads
 #   2.  Adapter trimming with Trimmomatic
 #   3.  Bowtie2 alignment
@@ -41,6 +42,14 @@ set -euo pipefail
 # Optional:
 #   START_STAGE=3 END_STAGE=16 bash bulk_atacseq_pipeline.sh
 #
+# Resource profile:
+#   Tuned for an 8-vCPU / 16-GB RAM VM.
+#   Samples are processed sequentially, while individual tools use bounded
+#   thread counts to avoid CPU/RAM oversubscription.
+#
+# Test mode:
+#   TEST_MODE=1 bash bulk_atacseq_pipeline.sh
+#
 ###############################################################################
 
 ############################
@@ -50,22 +59,39 @@ set -euo pipefail
 PROJECT_BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
 
 # Original raw-data location. This is INPUT ONLY and is never used for new outputs.
-# NOTE: raw fastqs now live under the Autumn 2026 folder, not directly under
-# PROJECT_BASE -- update this if the folder is renamed/moved again.
-RAW_DIR="/data/ATAC/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/ATAC_fastq_files_Autumn2026"
+RAW_DIR="${PROJECT_BASE}"
 
 # All newly generated analysis output is written below this folder.
 REANALYSIS_DIR="${PROJECT_BASE}/Reanalysis_ATAC_2026"
 
-START_STAGE="${START_STAGE:-1}"
+# Set TEST_MODE=1 to run Stages 1-18 against a small test dataset located under:
+#   ${REANALYSIS_DIR}/test_data
+TEST_MODE="${TEST_MODE:-0}"
+
+START_STAGE="${START_STAGE:-0}"
 END_STAGE="${END_STAGE:-18}"
 
+# Resource tuning for this VM:
+#   8 vCPUs
+#   16 GB RAM
+#
+# These defaults are intentionally conservative so piped tools do not
+# collectively oversubscribe the 8-vCPU machine.
 THREADS="${THREADS:-6}"
-FASTQC_THREADS="${FASTQC_THREADS:-16}"
+FASTQC_THREADS="${FASTQC_THREADS:-6}"
+TRIM_THREADS="${TRIM_THREADS:-6}"
 
-BT2_THREADS="${BT2_THREADS:-6}"
+BT2_THREADS="${BT2_THREADS:-4}"
 SORT_THREADS="${SORT_THREADS:-2}"
+
+SAMTOOLS_VIEW_THREADS="${SAMTOOLS_VIEW_THREADS:-2}"
+SAMTOOLS_SORT_THREADS="${SAMTOOLS_SORT_THREADS:-4}"
+
 SORT_MEM="${SORT_MEM:-2G}"
+PICARD_XMX="${PICARD_XMX:-6g}"
+
+# Stage 0 test subset size in FASTQ records, not lines.
+TEST_READS="${TEST_READS:-2500}"
 
 # Reference / software paths
 BT2_INDEX="/data/human_genome/GRCh38_index"
@@ -85,10 +111,14 @@ CONDA_SH="/data/miniconda/etc/profile.d/conda.sh"
 ITERATIVE_SCRIPT="${PROJECT_BASE}/Iterative_overlapping/createIterativeOverlapPeakSet.R"
 
 ############################
-# BASE DIRECTORY
+# BASE DIRECTORY SELECTION
 ############################
 
-BASE="${REANALYSIS_DIR}"
+if [[ "${TEST_MODE}" == "1" ]]; then
+    BASE="${REANALYSIS_DIR}/test_data"
+else
+    BASE="${REANALYSIS_DIR}"
+fi
 
 mkdir -p "${REANALYSIS_DIR}"
 
@@ -269,11 +299,11 @@ count_bam() {
 
     # Exclude secondary (0x100) and supplementary (0x800) alignments.
     # 0x900 = 0x100 + 0x800.
-    total_reads=$(samtools view -@ "${THREADS}" -c -F 2304 "${bam}")
+    total_reads=$(samtools view -@ "${SAMTOOLS_VIEW_THREADS}" -c -F 2304 "${bam}")
 
     # First-in-pair (0x40), excluding secondary/supplementary.
     # This counts one record per paired fragment.
-    total_fragments=$(samtools view -@ "${THREADS}" -c -f 64 -F 2304 "${bam}")
+    total_fragments=$(samtools view -@ "${SAMTOOLS_VIEW_THREADS}" -c -f 64 -F 2304 "${bam}")
 
     record_count_row "${stage}" "${sample}" "${total_reads}" "${total_fragments}"
 }
@@ -293,6 +323,57 @@ show_read_count_summary() {
 }
 
 ###############################################################################
+# STAGE 0 — BUILD TEST DATASET
+###############################################################################
+
+stage_0() {
+    log "STAGE 0: Building test dataset"
+
+    require_cmd seqtk
+    require_cmd gzip
+
+    local test_dir="${REANALYSIS_DIR}/test_data"
+    mkdir -p "${test_dir}"
+
+    shopt -s nullglob
+    local r1s=("${RAW_DIR}"/Sample_*/*_R1_001.fastq.gz)
+    (( ${#r1s[@]} > 0 )) || die "No raw R1 FASTQ files found under ${RAW_DIR}/Sample_*"
+
+    for R1 in "${r1s[@]}"; do
+        local R2="${R1/_R1_001.fastq.gz/_R2_001.fastq.gz}"
+        [[ -f "${R2}" ]] || {
+            echo "WARNING: Missing R2 for ${R1}; skipping" >&2
+            continue
+        }
+
+        local sample_dir
+        sample_dir=$(basename "$(dirname "${R1}")")
+
+        local out_sample_dir="${test_dir}/${sample_dir}"
+        mkdir -p "${out_sample_dir}"
+
+        local out_r1="${out_sample_dir}/$(basename "${R1}")"
+        local out_r2="${out_sample_dir}/$(basename "${R2}")"
+
+        if [[ -s "${out_r1}" && -s "${out_r2}" ]]; then
+            log "SKIP test subset: ${sample_dir}"
+            continue
+        fi
+
+        log "Subsetting ${sample_dir} to ${TEST_READS} read pairs"
+
+        # seqtk avoids the SIGPIPE issue caused by zcat | head under pipefail.
+        seqtk sample -s100 "${R1}" "${TEST_READS}" | gzip -c > "${out_r1}"
+        seqtk sample -s100 "${R2}" "${TEST_READS}" | gzip -c > "${out_r2}"
+
+        count_fastq_pair "00_test_FASTQ" "${sample_dir}" "${out_r1}" "${out_r2}"
+    done
+
+    show_read_count_summary
+    log "STAGE 0 complete"
+}
+
+###############################################################################
 # STAGE 1 — FASTQC RAW READS
 ###############################################################################
 
@@ -304,13 +385,20 @@ stage_1() {
 
     shopt -s nullglob
 
-    local fastqs=("${RAW_DIR}"/Sample_*/*_R1_001.fastq.gz "${RAW_DIR}"/Sample_*/*_R2_001.fastq.gz)
+    local input_fastq_root
+    if [[ "${TEST_MODE}" == "1" ]]; then
+        input_fastq_root="${BASE}"
+    else
+        input_fastq_root="${RAW_DIR}"
+    fi
+
+    local fastqs=("${input_fastq_root}"/Sample_*/*_R1_001.fastq.gz "${input_fastq_root}"/Sample_*/*_R2_001.fastq.gz)
     (( ${#fastqs[@]} > 0 )) || die "No FASTQ files found for Stage 1"
 
     fastqc -t "${FASTQC_THREADS}" "${fastqs[@]}" -o "${RAW_QC_DIR}"
     multiqc -f -o "${RAW_QC_DIR}" "${RAW_QC_DIR}"
 
-    local raw_r1s=("${RAW_DIR}"/Sample_*/*_R1_001.fastq.gz)
+    local raw_r1s=("${input_fastq_root}"/Sample_*/*_R1_001.fastq.gz)
     for R1 in "${raw_r1s[@]}"; do
         local R2="${R1/_R1_001.fastq.gz/_R2_001.fastq.gz}"
         [[ -s "${R2}" ]] || continue
@@ -338,7 +426,14 @@ stage_2() {
 
     shopt -s nullglob
 
-    local r1s=("${RAW_DIR}"/Sample_*/*_R1_001.fastq.gz)
+    local input_fastq_root
+    if [[ "${TEST_MODE}" == "1" ]]; then
+        input_fastq_root="${BASE}"
+    else
+        input_fastq_root="${RAW_DIR}"
+    fi
+
+    local r1s=("${input_fastq_root}"/Sample_*/*_R1_001.fastq.gz)
     (( ${#r1s[@]} > 0 )) || die "No R1 FASTQ files found for Stage 2"
 
     for R1 in "${r1s[@]}"; do
@@ -363,7 +458,7 @@ stage_2() {
         log "Trimming ${sample}"
 
         java -jar "${TRIM_JAR}" PE \
-            -threads "${FASTQC_THREADS}" \
+            -threads "${TRIM_THREADS}" \
             -phred33 \
             -trimlog "${out_prefix}.trimlog" \
             "${R1}" "${R2}" \
@@ -441,7 +536,7 @@ stage_3() {
             -x "${BT2_INDEX}" \
             -1 "${R1P}" \
             -2 "${R2P}" \
-        | samtools view -@ "${SORT_THREADS}" -b - \
+        | samtools view -@ "${SAMTOOLS_VIEW_THREADS}" -b - \
         | samtools sort \
             -@ "${SORT_THREADS}" \
             -m "${SORT_MEM}" \
@@ -485,10 +580,10 @@ stage_4() {
         if [[ ! -s "${OUT}" || ! -s "${OUT}.bai" ]]; then
             log "Filtering ${sample}"
 
-            samtools view -@ "${THREADS}" -bh -f 3 -q 30 "${BAM}" \
-            | samtools sort -@ "${THREADS}" -o "${OUT}" -
+            samtools view -@ "${SAMTOOLS_VIEW_THREADS}" -bh -f 3 -q 30 "${BAM}" \
+            | samtools sort -@ "${SAMTOOLS_SORT_THREADS}" -m "${SORT_MEM}" -o "${OUT}" -
 
-            samtools index -@ "${THREADS}" "${OUT}"
+            samtools index -@ "${SAMTOOLS_VIEW_THREADS}" "${OUT}"
         else
             log "SKIP filtering: ${sample}"
         fi
@@ -596,7 +691,7 @@ stage_6() {
 
         java \
             -Djava.io.tmpdir="${TMP_PICARD}" \
-            -Xmx8g \
+            -Xmx${PICARD_XMX} \
             -jar "${PICARD_JAR}" \
             MarkDuplicates \
             INPUT="${BAM}" \
@@ -607,11 +702,12 @@ stage_6() {
             VALIDATION_STRINGENCY=SILENT
 
         samtools sort \
-            --threads "${THREADS}" \
+            --threads "${SAMTOOLS_SORT_THREADS}" \
+            -m "${SORT_MEM}" \
             -o "${SORTED}" \
             "${UNSORTED}"
 
-        samtools index -@ "${THREADS}" "${SORTED}"
+        samtools index -@ "${SAMTOOLS_VIEW_THREADS}" "${SORTED}"
         rm -f "${UNSORTED}"
     done
 
@@ -667,18 +763,6 @@ stage_8() {
     local bams=("${DEDUP_DIR}"/*_dd_sorted.bam)
     (( ${#bams[@]} > 0 )) || die "No deduplicated BAMs found for Stage 8"
 
-    # Explicit allowlist of standard chromosomes, passed to samtools view as
-    # region arguments. This is preferred over grep/awk-filtering read lines:
-    # those approaches drop the unwanted alignment records but leave the
-    # chrM/chrUn_*/random/chrEBV entries sitting in the BAM header's @SQ
-    # lines. Giving samtools view an explicit region list makes it build a
-    # genuinely clean subset header containing only the requested contigs,
-    # using the BAM index rather than scanning every read.
-    local KEEP_CHRS=()
-    local i
-    for i in $(seq 1 22); do KEEP_CHRS+=("chr${i}"); done
-    KEEP_CHRS+=("chrX" "chrY")
-
     for BAM in "${bams[@]}"; do
         local sample
         sample=$(basename "${BAM%_dd_sorted.bam}")
@@ -688,12 +772,13 @@ stage_8() {
         if [[ ! -s "${OUT}" || ! -s "${OUT}.bai" ]]; then
             log "Chromosome filtering ${sample}"
 
-            require_file "${BAM}.bai"
-
-            samtools view -@ "${THREADS}" -b "${BAM}" "${KEEP_CHRS[@]}" \
+            # awk preserves the SAM header and removes alignments whose RNAME is
+            # chrM, chrEBV, begins with chrUn, or contains "random".
+            samtools view -@ "${THREADS}" -h "${BAM}" \
+            | awk 'BEGIN{OFS="\t"} /^@/ {print; next} $3=="chrM" {next} $3=="chrEBV" {next} $3 ~ /^chrUn/ {next} $3 ~ /random/ {next} {print}' \
             | samtools sort -@ "${THREADS}" -o "${OUT}" -
 
-            samtools index -@ "${THREADS}" "${OUT}"
+            samtools index -@ "${SAMTOOLS_VIEW_THREADS}" "${OUT}"
         else
             log "SKIP chromosome filtering: ${sample}"
         fi
@@ -807,10 +892,11 @@ stage_10() {
                 -b "${BLACKLIST}" \
                 -v \
             | samtools sort \
-                -@ "${THREADS}" \
+                -@ "${SAMTOOLS_SORT_THREADS}" \
+                -m "${SORT_MEM}" \
                 -o "${OUT}" -
 
-            samtools index -@ "${THREADS}" "${OUT}"
+            samtools index -@ "${SAMTOOLS_VIEW_THREADS}" "${OUT}"
         else
             log "SKIP blacklist filtering: ${sample}"
         fi
@@ -969,11 +1055,12 @@ stage_12() {
             --filterMetrics "${METRICS}"
 
         samtools sort \
-            --threads "${THREADS}" \
+            --threads "${SAMTOOLS_SORT_THREADS}" \
+            -m "${SORT_MEM}" \
             -o "${SORTED}" \
             "${UNSORTED}"
 
-        samtools index -@ "${THREADS}" "${SORTED}"
+        samtools index -@ "${SAMTOOLS_VIEW_THREADS}" "${SORTED}"
         rm -f "${UNSORTED}"
     done
 
@@ -1263,8 +1350,14 @@ main() {
     log "RAW_DIR=${RAW_DIR}"
     log "REANALYSIS_DIR=${REANALYSIS_DIR}"
     log "BASE=${BASE}"
+    log "VM tuning: 8 vCPU / 16 GB RAM"
+    log "THREADS=${THREADS}, FASTQC_THREADS=${FASTQC_THREADS}, TRIM_THREADS=${TRIM_THREADS}"
+    log "BT2_THREADS=${BT2_THREADS}, SORT_THREADS=${SORT_THREADS}, SAMTOOLS_VIEW_THREADS=${SAMTOOLS_VIEW_THREADS}, SAMTOOLS_SORT_THREADS=${SAMTOOLS_SORT_THREADS}"
+    log "SORT_MEM=${SORT_MEM}, PICARD_XMX=${PICARD_XMX}"
     log "Stages ${START_STAGE} through ${END_STAGE}"
+    log "TEST_MODE=${TEST_MODE}"
 
+    if run_stage 0; then stage_0; fi
     if run_stage 1; then stage_1; fi
     if run_stage 2; then stage_2; fi
     if run_stage 3; then stage_3; fi
