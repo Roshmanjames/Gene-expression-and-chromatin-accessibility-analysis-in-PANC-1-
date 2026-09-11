@@ -59,7 +59,8 @@ set -euo pipefail
 PROJECT_BASE="/data/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12"
 
 # Original raw-data location. This is INPUT ONLY and is never used for new outputs.
-RAW_DIR="${PROJECT_BASE}"
+# Current FASTQs are stored under the Autumn 2026 folder.
+RAW_DIR="/data/ATAC/240117_A01447.A.Project_Pandey-ATAC1-2024-01-12/ATAC_fastq_files_Autumn2026"
 
 # All newly generated analysis output is written below this folder.
 REANALYSIS_DIR="${PROJECT_BASE}/Reanalysis_ATAC_2026"
@@ -68,7 +69,7 @@ REANALYSIS_DIR="${PROJECT_BASE}/Reanalysis_ATAC_2026"
 #   ${REANALYSIS_DIR}/test_data
 TEST_MODE="${TEST_MODE:-0}"
 
-START_STAGE="${START_STAGE:-0}"
+START_STAGE="${START_STAGE:-1}"
 END_STAGE="${END_STAGE:-18}"
 
 # Resource tuning for this VM:
